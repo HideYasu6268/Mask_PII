@@ -1,0 +1,16 @@
+# llama-cpp-pythonはWindowsだとソースビルドでパス長エラーになりやすいため、
+# プリビルドwheel(CPU版)を優先的に見に行くよう指定している
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+
+customtkinter>=5.2.0
+tksheet>=7.0.0
+llama-cpp-python>=0.3.0
+huggingface_hub>=0.24.0
+
+# Outlookデスクトップアプリからのメール取得(Windows専用、COM経由でローカル完結)
+pywin32>=306; sys_platform == "win32"
+
+# 任意(人名/組織名/地名のNERを使う場合)
+spacy>=3.7.0
+ginza
+ja-ginza
