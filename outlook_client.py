@@ -21,6 +21,9 @@ _PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
 # 時間がかかるため、上限を設けて「見つからなければ諦める」設計にしている。
 DEFAULT_SENT_SCAN_LIMIT = 200
 
+# 過去の送信済みメールから拾う「宛名・挨拶」として扱う先頭の行数。
+GREETING_LINE_COUNT = 7
+
 
 class OutlookError(RuntimeError):
     pass
@@ -54,7 +57,7 @@ def _find_latest_sent_greeting(
     namespace, sender_email: str, max_scan: int = DEFAULT_SENT_SCAN_LIMIT
 ) -> str | None:
     """送信済みメールを送信日時の新しい順に最大max_scan件まで見て、
-    sender_email宛てに送った最新のメールを探し、本文の先頭5行
+    sender_email宛てに送った最新のメールを探し、本文の先頭GREETING_LINE_COUNT行
     (宛名・挨拶部分だと想定)を返す。見つからなければNone
     (呼び出し元は「宛名・挨拶なし」にフォールバックすること)。
     """
@@ -78,12 +81,51 @@ def _find_latest_sent_greeting(
             )
             if matched:
                 body = str(item.Body or "")
-                greeting = "\n".join(body.splitlines()[:5]).strip()
+                greeting = "\n".join(body.splitlines()[:GREETING_LINE_COUNT]).strip()
                 return greeting or None
         except Exception:  # noqa: BLE001
             pass  # 1件の読み取りに失敗しても、全体を諦めずに次へ進む
         item = items.GetNext()
     return None
+
+
+def _insert_reply_body(reply, reply_body: str) -> None:
+    """Reply()で作成した返信アイテムの本文の先頭に、reply_body(匿名化解除後の
+    返信文、宛名・挨拶・署名込み)を差し込む。
+
+    reply.Body(プレーンテキスト)に直接書き込むと、返信が既定のHTML形式の場合
+    Outlookがこちらの差し込み分だけ独自のデフォルト書式で包んでしまい、
+    Reply()が自動生成した引用部分(元のHTML書式)と見た目が食い違う
+    (先頭とそれ以外で書式が変わって見える)。そのため、HTML形式の場合は
+    reply.HTMLBody の <body> タグの直後に差し込み、引用部分と同じ既定書式を
+    継承させる。HTML形式でない場合(プレーンテキスト/リッチテキスト)は
+    フォーマットの継承を気にする必要が無いため、reply.Body への追記のままでよい。
+    """
+    try:
+        body_format = reply.BodyFormat
+    except Exception:  # noqa: BLE001
+        body_format = None
+
+    if body_format != 2:  # 2 = olFormatHTML以外は従来通りプレーンテキストで追記
+        reply.Body = f"{reply_body}\n\n{reply.Body}"
+        return
+
+    escaped = (
+        reply_body.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+    html_fragment = escaped.replace("\n", "<br>\n") + "<br><br>\n"
+
+    original_html = reply.HTMLBody
+    match_pos = original_html.lower().find("<body")
+    if match_pos == -1:
+        # <body>タグが見つからない異常なケースへのフォールバック。
+        reply.Body = f"{reply_body}\n\n{reply.Body}"
+        return
+
+    tag_end = original_html.find(">", match_pos) + 1
+    reply.HTMLBody = original_html[:tag_end] + html_fragment + original_html[tag_end:]
 
 
 def get_latest_unread_email() -> dict | None:
@@ -96,7 +138,7 @@ def get_latest_unread_email() -> dict | None:
     entry_id/store_idは、後から create_quoted_reply() でこの同じメールを
     Outlook側から再度特定し、Outlook標準の引用返信を作成するために使う。
     greetingは、差出人(sender_email)へ過去に送った送信済みメールのうち
-    最新のものの先頭5行(宛名・挨拶だと想定)。見つからない場合はNone
+    最新のものの先頭GREETING_LINE_COUNT行(宛名・挨拶だと想定)。見つからない場合はNone
     (ベストエフォートのため、取得できなくてもメール取得自体は失敗させない)。
     未読メールが1件も無い場合は None を返す。
     Outlookが未インストール/未起動、またはCOM操作に失敗した場合は OutlookError。
@@ -143,7 +185,7 @@ def get_latest_unread_email() -> dict | None:
             }
 
             # 過去にこの相手(sender_email)へ送った直近のメールから、宛名・挨拶
-            # (先頭5行)を拾えれば、返信作成時に再利用する(main.py側)。
+            # (先頭GREETING_LINE_COUNT行)を拾えれば、返信作成時に再利用する(main.py側)。
             # あくまで補助情報なので、取得に失敗してもメール取得自体は失敗させない。
             try:
                 result["greeting"] = (
@@ -199,7 +241,7 @@ def create_quoted_reply(entry_id: str, store_id: str, reply_body: str) -> None:
 
         try:
             reply = mail_item.Reply()
-            reply.Body = f"{reply_body}\n\n{reply.Body}"
+            _insert_reply_body(reply, reply_body)
             reply.Display()
         except Exception as e:  # noqa: BLE001
             raise OutlookError(f"引用返信の作成に失敗しました: {e}") from e
