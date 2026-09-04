@@ -9,6 +9,7 @@ outlook_client.py
 
 from __future__ import annotations
 
+import re
 import threading
 
 # Exchangeアカウントだと SenderEmailAddress や Recipient.Address が素のSMTP
@@ -22,7 +23,7 @@ _PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
 DEFAULT_SENT_SCAN_LIMIT = 200
 
 # 過去の送信済みメールから拾う「宛名・挨拶」として扱う先頭の行数。
-GREETING_LINE_COUNT = 7
+GREETING_LINE_COUNT = 13
 
 
 class OutlookError(RuntimeError):
@@ -100,6 +101,29 @@ def _insert_reply_body(reply, reply_body: str) -> None:
     reply.HTMLBody の <body> タグの直後に差し込み、引用部分と同じ既定書式を
     継承させる。HTML形式でない場合(プレーンテキスト/リッチテキスト)は
     フォーマットの継承を気にする必要が無いため、reply.Body への追記のままでよい。
+
+    OutlookがWord編集エンジンで作成したHTML本文は、<body>タグ自体には
+    フォント指定が無く、各段落に class="MsoNormal" を付与することでスタイル
+    (游ゴシック等)を当てる作りになっている。素のテキストを<body>直後にそのまま
+    差し込むだけだとこのクラスが付かず、ブラウザ既定フォント(Times New Roman相当)
+    になって残りの部分と食い違うため、MsoNormalクラスが定義されている場合は
+    そのクラスを使って同じ見た目に揃える。
+
+    改行の表現方法も重要: 当初は全行を1つの段落(<p>/<div>)にまとめ、行内改行
+    (<br>、Wordの書式記号では"↓")で区切っていたが、実機で確認したところ、
+    このWordスタイルでは行内改行(↓)の行間が、本物の段落区切り(Enterによる
+    ¶、Wordの書式記号では"↵")の行間より明らかに広く、引用部分(本物の段落の
+    連続)と比べて間延びして見えることが分かった。そのため、行ごとに独立した
+    <p class="MsoNormal">(本物の段落)として差し込み、¶と同じ行間になるようにする。
+
+    また、Word文書内の実際の段落は、クラス自体のmargin指定(0mm)とは別に、
+    style属性で margin-bottom(通常12.0pt等)を個別に指定していることが多い。
+    差し込む各段落にもこれが無いと段落間隔が周囲と食い違うため、元の文書から
+    実際に使われているmargin-bottom値を拾えれば、それを各段落にも適用する。
+
+    空行は <p class="MsoNormal">&nbsp;</p> として表現する(空の<p></p>は
+    平文変換時に消えてしまい、行そのものが無かったことになるため)。これは
+    Word自身が空の段落をHTMLとして書き出す際の標準的な表現方法でもある。
     """
     try:
         body_format = reply.BodyFormat
@@ -115,9 +139,25 @@ def _insert_reply_body(reply, reply_body: str) -> None:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
-    html_fragment = escaped.replace("\n", "<br>\n") + "<br><br>\n"
 
     original_html = reply.HTMLBody
+    if "MsoNormal" in original_html:
+        # 実際の段落(<p class=MsoNormal ... style='...margin-bottom:12.0pt...'>)から
+        # margin-bottomの値を拾えれば、差し込む各段落にも同じ値を指定して段落間隔を
+        # 揃える(見つからなければ指定なしのまま)。
+        margin_match = re.search(
+            r'<p\b[^>]*\bclass=(?:"MsoNormal"|MsoNormal)\b[^>]*\bstyle=(["\'])'
+            r'[^"\']*?margin-bottom:\s*([^;"\']+)',
+            original_html,
+        )
+        style_attr = f' style="margin-bottom:{margin_match.group(2)}"' if margin_match else ""
+        lines = escaped.split("\n")
+        html_fragment = "".join(
+            f'<p class="MsoNormal"{style_attr}>{line or "&nbsp;"}</p>' for line in lines
+        )
+        html_fragment += f'<p class="MsoNormal"{style_attr}>&nbsp;</p>'
+    else:
+        html_fragment = escaped.replace("\n", "<br>\n") + "<br><br>\n"
     match_pos = original_html.lower().find("<body")
     if match_pos == -1:
         # <body>タグが見つからない異常なケースへのフォールバック。

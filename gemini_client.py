@@ -10,6 +10,10 @@ Google Gemini APIとの通信を行う(このアプリで唯一、外部にネ�
   次の行のキーに自動で切り替えて再試行する(全キーが429の場合のみエラーになる)。
   このファイルは.gitignore対象で、リポジトリには仮の値しか入っていない。
   実際に使う際は自分のAPIキーに書き換えること。
+  各キーはアカウントごとに使えるモデルが異なるため、キーの接頭辞から
+  推奨モデルを自動選択する(_preferred_model_for_key参照。AIzaSy...形式→
+  DEFAULT_MODEL、AQ.形式→FALLBACK_MODEL)。推奨モデルが404(NOT_FOUND)の
+  場合は、そのキーのままもう一方のモデルで再試行する。
 - プロンプトテンプレートは同じディレクトリの reply_prompt_template.txt から読み込む。
   テンプレート中の {reply_intent} / {anonymized_text} が、それぞれアプリ上の
   「どういう返信をしたいか」欄の内容・匿名化後の文章に置き換わる。
@@ -31,9 +35,23 @@ PROMPT_TEMPLATE_PATH = os.path.join(APP_DIR, "reply_prompt_template.txt")
 
 DEFAULT_MODEL = "gemini-2.5-flash"
 
+# DEFAULT_MODELが404(NOT_FOUND、新規アカウントで利用不可などモデル自体が
+# 使えないケース)になった場合に自動で切り替えて再試行するモデル。
+FALLBACK_MODEL = "gemini-3.6-flash"
+
 # gemini_api_key.txt に最初から入っている仮の値。これがそのまま残っている場合は
 # 未設定とみなし、実際にはAPIを呼ばずにエラーを返す。
 _PLACEHOLDER_KEY = "YOUR_API_KEY_HERE"
+
+
+def _preferred_model_for_key(api_key: str) -> str:
+    """APIキーの接頭辞からアカウント種別を判定し、そのアカウントで通ることが
+    分かっているモデルを返す(AIzaSy...形式のキー→DEFAULT_MODEL、
+    AQ.形式のキー→FALLBACK_MODEL)。どちらにも一致しないキーはDEFAULT_MODELを使う。
+    """
+    if api_key.startswith("AQ"):
+        return FALLBACK_MODEL
+    return DEFAULT_MODEL
 
 
 class GeminiError(RuntimeError):
@@ -128,22 +146,50 @@ def generate_reply(
         tools=[types.Tool(google_search=types.GoogleSearch())],
     )
 
+    # modelが呼び出し元から明示的に指定されていない(=デフォルトのまま)場合のみ、
+    # キーの接頭辞ごとの推奨モデル→もう一方のモデルの順で試す。明示的に指定された
+    # 場合はそのモデルのみを使う。
+    caller_specified_model = model != DEFAULT_MODEL
+
+    resp = None
     last_error: Exception | None = None
+    tried_models: list[str] = []
     for api_key in api_keys:
-        try:
-            client = genai.Client(api_key=api_key)
-            resp = client.models.generate_content(model=model, contents=prompt, config=config)
+        client = genai.Client(api_key=api_key)
+        if caller_specified_model:
+            models_to_try = [model]
+        else:
+            preferred = _preferred_model_for_key(api_key)
+            other = FALLBACK_MODEL if preferred == DEFAULT_MODEL else DEFAULT_MODEL
+            models_to_try = [preferred, other]
+        for m in models_to_try:
+            if m not in tried_models:
+                tried_models.append(m)
+            try:
+                resp = client.models.generate_content(model=m, contents=prompt, config=config)
+                break
+            except genai_errors.ClientError as e:
+                if e.code == 404:
+                    # このモデルが使えない。もう一方のモデルがあればそちらで再試行する。
+                    last_error = e
+                    continue
+                if e.code == 429:
+                    # このキーがレート制限に達した。次のキーがあればそちらで再試行する。
+                    last_error = e
+                    break
+                raise GeminiError(f"Gemini APIとの通信中にエラーが発生しました: {e}") from e
+            except Exception as e:  # noqa: BLE001
+                raise GeminiError(f"Gemini APIとの通信中にエラーが発生しました: {e}") from e
+        if resp is not None:
             break
-        except genai_errors.ClientError as e:
-            if e.code == 429:
-                # このキーがレート制限に達した。次のキーがあればそちらで再試行する。
-                last_error = e
-                continue
-            raise GeminiError(f"Gemini APIとの通信中にエラーが発生しました: {e}") from e
-        except Exception as e:  # noqa: BLE001
-            raise GeminiError(f"Gemini APIとの通信中にエラーが発生しました: {e}") from e
-    else:
-        if len(api_keys) == 1:
+
+    if resp is None:
+        if isinstance(last_error, genai_errors.ClientError) and last_error.code == 404:
+            message = (
+                f"指定されたモデル({', '.join(tried_models)})がいずれも利用できませんでした。"
+                " gemini_client.pyのDEFAULT_MODEL / FALLBACK_MODELを見直してください。"
+            )
+        elif len(api_keys) == 1:
             message = "Gemini APIのレート制限(429)に達しました。しばらく待ってから再試行してください。"
         else:
             message = (
