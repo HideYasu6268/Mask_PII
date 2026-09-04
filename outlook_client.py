@@ -11,19 +11,93 @@ from __future__ import annotations
 
 import threading
 
+# Exchangeアカウントだと SenderEmailAddress や Recipient.Address が素のSMTP
+# アドレスではなく内部形式(Exchange DN、"/O=..."等)を返すことがあるため、
+# その場合のみ PropertyAccessor で実際のSMTPアドレスを取り直す。
+_PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
+
+# 「①メール取得」の相手先へ過去に送った最新メールを、送信済みフォルダの
+# 新しい順に何件まで遡って探すか。多くしすぎるとCOM経由の逐次アクセスで
+# 時間がかかるため、上限を設けて「見つからなければ諦める」設計にしている。
+DEFAULT_SENT_SCAN_LIMIT = 200
+
 
 class OutlookError(RuntimeError):
     pass
+
+
+def _get_sender_smtp_address(mail_item) -> str:
+    """MailItemの差出人の実際のSMTPアドレスを取り出す(ベストエフォート)。"""
+    addr = str(getattr(mail_item, "SenderEmailAddress", "") or "")
+    if "@" in addr:
+        return addr
+    try:
+        smtp = mail_item.Sender.PropertyAccessor.GetProperty(_PR_SMTP_ADDRESS)
+        return str(smtp or "")
+    except Exception:  # noqa: BLE001
+        return addr
+
+
+def _get_recipient_smtp_address(recipient) -> str:
+    """Recipientの実際のSMTPアドレスを取り出す(ベストエフォート)。"""
+    addr = str(getattr(recipient, "Address", "") or "")
+    if "@" in addr:
+        return addr
+    try:
+        smtp = recipient.PropertyAccessor.GetProperty(_PR_SMTP_ADDRESS)
+        return str(smtp or "")
+    except Exception:  # noqa: BLE001
+        return addr
+
+
+def _find_latest_sent_greeting(
+    namespace, sender_email: str, max_scan: int = DEFAULT_SENT_SCAN_LIMIT
+) -> str | None:
+    """送信済みメールを送信日時の新しい順に最大max_scan件まで見て、
+    sender_email宛てに送った最新のメールを探し、本文の先頭5行
+    (宛名・挨拶部分だと想定)を返す。見つからなければNone
+    (呼び出し元は「宛名・挨拶なし」にフォールバックすること)。
+    """
+    target = sender_email.strip().lower()
+    if not target:
+        return None
+
+    sent_folder = namespace.GetDefaultFolder(5)  # 5 = olFolderSentMail
+    items = sent_folder.Items
+    items.Sort("[SentOn]", True)  # 新しい順
+
+    scanned = 0
+    item = items.GetFirst()
+    while item is not None and scanned < max_scan:
+        scanned += 1
+        try:
+            recipients = item.Recipients
+            matched = any(
+                _get_recipient_smtp_address(recipients.Item(i)).strip().lower() == target
+                for i in range(1, recipients.Count + 1)
+            )
+            if matched:
+                body = str(item.Body or "")
+                greeting = "\n".join(body.splitlines()[:5]).strip()
+                return greeting or None
+        except Exception:  # noqa: BLE001
+            pass  # 1件の読み取りに失敗しても、全体を諦めずに次へ進む
+        item = items.GetNext()
+    return None
 
 
 def get_latest_unread_email() -> dict | None:
     """Outlookの受信トレイから、受信日時が最も新しい未読メール1件を取得する。
     取得したメールは既読に更新する(同じメールを繰り返し取得しないようにするため)。
 
-    戻り値: {"subject": str, "sender": str, "body": str, "received": str,
-             "entry_id": str, "store_id": str}
+    戻り値: {"subject": str, "sender": str, "sender_email": str, "body": str,
+             "received": str, "entry_id": str, "store_id": str,
+             "greeting": str | None}
     entry_id/store_idは、後から create_quoted_reply() でこの同じメールを
     Outlook側から再度特定し、Outlook標準の引用返信を作成するために使う。
+    greetingは、差出人(sender_email)へ過去に送った送信済みメールのうち
+    最新のものの先頭5行(宛名・挨拶だと想定)。見つからない場合はNone
+    (ベストエフォートのため、取得できなくてもメール取得自体は失敗させない)。
     未読メールが1件も無い場合は None を返す。
     Outlookが未インストール/未起動、またはCOM操作に失敗した場合は OutlookError。
     """
@@ -54,9 +128,11 @@ def get_latest_unread_email() -> dict | None:
             if unread_items.Count == 0:
                 return None
             latest = unread_items.GetFirst()
+            sender_email = _get_sender_smtp_address(latest)
             result = {
                 "subject": str(latest.Subject or ""),
                 "sender": str(getattr(latest, "SenderName", "") or ""),
+                "sender_email": sender_email,
                 "body": str(latest.Body or ""),
                 # ReceivedTimeはCOM経由の独自の日時型なのでstr()でそのまま文字列化する。
                 "received": str(getattr(latest, "ReceivedTime", "") or ""),
@@ -65,6 +141,17 @@ def get_latest_unread_email() -> dict | None:
                 "entry_id": str(latest.EntryID),
                 "store_id": str(latest.Parent.StoreID),
             }
+
+            # 過去にこの相手(sender_email)へ送った直近のメールから、宛名・挨拶
+            # (先頭5行)を拾えれば、返信作成時に再利用する(main.py側)。
+            # あくまで補助情報なので、取得に失敗してもメール取得自体は失敗させない。
+            try:
+                result["greeting"] = (
+                    _find_latest_sent_greeting(namespace, sender_email) if sender_email else None
+                )
+            except Exception:  # noqa: BLE001
+                result["greeting"] = None
+
             # 取得したメールは未読のまま残さず、既読に更新しておく
             # (次回「①メール取得」を押したときに同じメールを再取得しないようにするため)。
             latest.UnRead = False

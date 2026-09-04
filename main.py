@@ -860,6 +860,14 @@ class PiiAnonymizerApp(ctk.CTk):
         rev_mapping = reverse_mapping(mapping)
         result = apply_mapping(encoded_text, rev_mapping)
 
+        # ①メール取得時に、相手への過去の送信済みメールから拾えていれば、
+        # その宛名・挨拶(先頭5行、実名を含む)をここでローカルに先頭へ差し込む。
+        # 署名と同様、Geminiには一切送信しない(on_generate_replyの送信対象は
+        # あくまで匿名化後の文章のみで、この処理はその後段でのみ行われる)。
+        greeting = (self._fetched_mail or {}).get("greeting")
+        if greeting:
+            result = f"{greeting}\n\n{result}"
+
         signature = _load_signature()
         if signature:
             result = f"{result}\n\n{signature}"
