@@ -29,6 +29,7 @@ PII匿名化デスクトップアプリ(プロトタイプ)
 from __future__ import annotations
 
 import threading
+import time
 import tkinter as tk
 import tkinter.messagebox as messagebox
 from pathlib import Path
@@ -41,6 +42,7 @@ from pii_core import (
     reverse_mapping, append_to_master_dictionary, load_master_dictionary,
     detect_from_dictionary, PiiItem,
 )
+import gemini_client
 import local_llm
 import outlook_client
 
@@ -53,6 +55,20 @@ SHEET_HEADERS = ["元の値", "匿名化後", "種別"]
 # プレビュー更新のたびに、対応表の内容(元の値・匿名化後・種別)を蓄積していく
 # マスター辞書CSV。既知の値は上書きせず追記のみ(pii_core.append_to_master_dictionary参照)。
 MASTER_DICTIONARY_PATH = Path(__file__).resolve().parent / "pii_dictionary.csv"
+
+# 匿名化解除後の返信文の末尾に付ける署名。ファイルが無ければ単に付けない
+# (必須ではない)。呼び出しのたびに読み直すので、アプリを再起動しなくても
+# 内容の変更がすぐ反映される。
+SIGNATURE_PATH = Path(__file__).resolve().parent / "署名.txt"
+
+
+def _load_signature() -> str:
+    if not SIGNATURE_PATH.is_file():
+        return ""
+    try:
+        return SIGNATURE_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 class PiiAnonymizerApp(ctk.CTk):
@@ -77,6 +93,25 @@ class PiiAnonymizerApp(ctk.CTk):
         # 呼び出しが重ならないようにするフラグ。連打や複数ボタンからの同時呼び出しは
         # ネイティブクラッシュにつながるため(_llm_call_begin/_llm_call_end参照)。
         self._llm_busy = False
+        # ローカルLLM推論中の経過秒数表示用(_tick_llm_progress参照)。
+        # トークン単位の進捗はllama-cpp-python側に無いため、経過時間のみ表示する。
+        self._llm_progress_start: float | None = None
+        self._llm_progress_after_id: str | None = None
+
+        # Gemini API(「🤖 AIによる返答生成」)呼び出し中の連打防止フラグ。
+        # ローカルLLMとは別のシングルトンロックは不要(呼び出しごとにHTTPリクエストが
+        # 独立するだけ)だが、同じボタンの連打で問い合わせが重複するのを防ぐ。
+        self._gemini_busy = False
+
+        # 「①メール取得」で最後に取得したメール
+        # ({"subject","sender","body","received","entry_id","store_id"})。
+        # 「返信メール作成」がOutlook側でこのメールを再度特定し、標準の「返信」
+        # (引用を自動生成)を作るのに使う。手動入力時など未取得の場合はNoneのままで、
+        # その場合「返信メール作成」は使えない旨を案内する。
+        self._fetched_mail: dict | None = None
+
+        # 「返信メール作成」(Outlook操作)の連打防止フラグ。
+        self._outlook_busy = False
 
     # ------------------------------------------------------------------
     # UI構築
@@ -101,6 +136,12 @@ class PiiAnonymizerApp(ctk.CTk):
         self.use_ner_var = tk.BooleanVar(value=True)
         ctk.CTkCheckBox(bar, text="NER(人名/組織名)も使う", variable=self.use_ner_var
                          ).pack(side="left", padx=(12, 0))
+
+        # 「匿名化対象を検出」「タグ割当」でのローカルLLM推論中、経過秒数を表示する
+        # (_llm_call_begin/_llm_call_end/_tick_llm_progress参照)。トークン単位の
+        # 進捗はllama-cpp-python側に無いため、経過時間のみの簡易表示にとどめる。
+        self.llm_progress_label = ctk.CTkLabel(bar, text="", text_color="gray")
+        self.llm_progress_label.pack(side="left", padx=(12, 0))
 
     def _build_main_area(self):
         self.tabview = ctk.CTkTabview(self, command=self._on_tab_changed)
@@ -231,8 +272,10 @@ class PiiAnonymizerApp(ctk.CTk):
         right_btn_row.grid_columnconfigure((0, 1), weight=1)
         ctk.CTkButton(right_btn_row, text="プレビュー更新", width=1,
                       command=self.on_apply_mapping).grid(row=0, column=0, sticky="ew", padx=(0, 3))
-        ctk.CTkButton(right_btn_row, text="🤖 AIによる返答生成", width=1, state="disabled"
-                      ).grid(row=0, column=1, sticky="ew", padx=(3, 0))
+        self.btn_generate_reply = ctk.CTkButton(
+            right_btn_row, text="🤖 AIによる返答生成", width=1,
+            command=self.on_generate_reply)
+        self.btn_generate_reply.grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
     def _on_anonymize_area_resize(self, event):
         # CTkFrameは.bind()を内部キャンバスへ委譲するためevent.widget/event.width
@@ -254,13 +297,14 @@ class PiiAnonymizerApp(ctk.CTk):
         # 対応表は参照用で情報量が少ないため、①タブ以上にテキストエリア側へ幅を寄せる。
         area.grid_columnconfigure(0, weight=3)  # 解除後プレビュー(平文)
         area.grid_columnconfigure(1, weight=1)  # 対応表(参照用)
-        area.grid_columnconfigure(2, weight=3)  # 匿名化されたテキスト入力
+        area.grid_columnconfigure(2, weight=3)  # AIによる返信案(匿名化)
 
         ctk.CTkLabel(
             area,
-            text="右側に匿名化語(タグ付き)のテキストを貼り付け、対応表(①タブと連動・参照用)を使って"
-                 "左側に元の値へ解除したプレビューを表示します。"
-                 "(例: 匿名化したテキストを外部LLMに渡し、返ってきた結果をここに貼り付ける)",
+            text="①タブで「🤖 AIによる返答生成」を実行すると、生成された返信案がこのタブの"
+                 "右側に自動で反映され、対応表(①タブと連動・参照用)を使って左側に元の値へ"
+                 "解除したプレビューが自動表示されます。税務・会計の質問でGoogle検索による"
+                 "根拠確認(グラウンディング)が行われた場合、その根拠情報も右下に表示されます。",
             anchor="w", justify="left",
         ).grid(row=0, column=0, columnspan=3, sticky="ew", padx=4, pady=(0, 4))
 
@@ -270,13 +314,22 @@ class PiiAnonymizerApp(ctk.CTk):
         ctk.CTkLabel(left, text="匿名化解除後プレビュー", font=ctk.CTkFont(weight="bold")
                      ).pack(anchor="w", padx=8, pady=(8, 2))
         self.deanon_preview_box = ctk.CTkTextbox(left, wrap="word")
-        self.deanon_preview_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.deanon_preview_box.pack(fill="both", expand=True, padx=8, pady=(0, 4))
         self.deanon_preview_box.configure(state="disabled")
 
+        deanon_btn_row = ctk.CTkFrame(left, fg_color="transparent")
+        deanon_btn_row.pack(fill="x", padx=8, pady=(0, 8))
+        deanon_btn_row.grid_columnconfigure((0, 1), weight=1)
+        self.btn_create_reply_mail = ctk.CTkButton(deanon_btn_row, text="返信メール作成", width=1,
+                      command=self.on_create_reply_mail)
+        self.btn_create_reply_mail.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        ctk.CTkButton(deanon_btn_row, text="削除", fg_color="#a33", hover_color="#822", width=1,
+                      command=self.on_clear_all).grid(row=0, column=1, sticky="ew", padx=(3, 0))
+
         # --- 中央: 対応表(①タブの内容を表示するだけの参照用、念のため) ---
-        # 操作ボタンはここ(対応表の直下)に置く。左右のテキストエリアの列とは
-        # 別の列に留めているため、テキストエリアにボタンが被さることはない。
-        # 中身(表・ボタン)の自然な要求幅は無視し、幅300pxで固定する。
+        # 匿名化解除は①タブの「🤖 AIによる返答生成」から自動実行される想定のため、
+        # ここに操作ボタンは置かない。
+        # 中身(表)の自然な要求幅は無視し、幅300pxで固定する。
         # (grid列のweight比による配分は、中身の要求幅がそれより大きいと
         # 無効化されてしまうため、pack_propagate(False)で強制的に絞る)
         mid = ctk.CTkFrame(area, width=160)
@@ -301,16 +354,24 @@ class PiiAnonymizerApp(ctk.CTk):
             "single_select", "row_select", "column_select", "arrowkeys", "copy",
         )
         self.deanon_ref_sheet.pack(fill="both", expand=True)
-        ctk.CTkButton(mid, text="🔓 匿名化を解除",
-                      command=self.on_deanonymize).pack(fill="x", padx=8, pady=(0, 8))
 
-        # --- 右: 匿名化されたテキストの入力 ---
+        # --- 右: AIによる返信案(匿名化)。手動で他の匿名化済みテキストを貼り付けてもよい ---
         right = ctk.CTkFrame(area)
         right.grid(row=1, column=2, sticky="nsew", padx=(4, 0))
-        ctk.CTkLabel(right, text="匿名化されたテキスト(貼り付け)", font=ctk.CTkFont(weight="bold")
+        ctk.CTkLabel(right, text="AIによる返信案(匿名化)", font=ctk.CTkFont(weight="bold")
                      ).pack(anchor="w", padx=8, pady=(8, 2))
         self.deanon_input_box = ctk.CTkTextbox(right, wrap="word")
         self.deanon_input_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        # AIによる返答生成時、Google検索によるグラウンディングで実際に参照した
+        # Webページ(根拠)があれば表示する。手動で貼り付けたテキストの匿名化解除
+        # では根拠情報が無いため、その旨を表示する(_on_generate_reply_done参照)。
+        ctk.CTkLabel(right, text="AIが参照した根拠情報(Google検索によるグラウンディング)",
+                     font=ctk.CTkFont(weight="bold")
+                     ).pack(anchor="w", padx=8, pady=(0, 2))
+        self.deanon_sources_box = ctk.CTkTextbox(right, wrap="word", height=140)
+        self.deanon_sources_box.pack(fill="x", padx=8, pady=(0, 8))
+        self._set_deanon_sources_text("(まだAIによる返答生成は実行されていません)")
 
         area.grid_rowconfigure(1, weight=1)
 
@@ -342,12 +403,32 @@ class PiiAnonymizerApp(ctk.CTk):
         self._llm_busy = True
         self.btn_detect_all.configure(state="disabled")
         self.btn_llm_classify.configure(state="disabled")
+        self._llm_progress_start = time.monotonic()
+        self._tick_llm_progress()
         return True
 
     def _llm_call_end(self):
         self._llm_busy = False
         self.btn_detect_all.configure(state="normal")
         self.btn_llm_classify.configure(state="normal")
+        self._llm_progress_start = None
+        if self._llm_progress_after_id is not None:
+            self.after_cancel(self._llm_progress_after_id)
+            self._llm_progress_after_id = None
+        self.llm_progress_label.configure(text="")
+
+    def _tick_llm_progress(self):
+        """ローカルLLM推論中、1秒おきに経過秒数を表示し続ける。トークン単位の
+        進捗はllama-cpp-python側に無いため、あくまで「動いている」ことが
+        分かる程度の簡易表示(正確な完了見込み時間ではない)。
+        """
+        if not self._llm_busy or self._llm_progress_start is None:
+            self.llm_progress_label.configure(text="")
+            self._llm_progress_after_id = None
+            return
+        elapsed = int(time.monotonic() - self._llm_progress_start)
+        self.llm_progress_label.configure(text=f"🧠 ローカルLLM推論中...({elapsed}秒経過)")
+        self._llm_progress_after_id = self.after(1000, self._tick_llm_progress)
 
     # ------------------------------------------------------------------
     # sheet <-> rows 同期ヘルパー
@@ -478,6 +559,7 @@ class PiiAnonymizerApp(ctk.CTk):
             return
         self.source_box.delete("1.0", "end")
         self.source_box.insert("1.0", mail["body"])
+        self._fetched_mail = mail
         self.set_status(f"未読メールを取得しました(件名: {mail['subject']} / 差出人: {mail['sender']})。")
 
     def _on_fetch_mail_error(self, msg: str):
@@ -674,27 +756,113 @@ class PiiAnonymizerApp(ctk.CTk):
             status += f" (文字コードの都合で{len(dict_skipped)}件は辞書に保存できませんでした。)"
         self.set_status(status)
 
+    def on_generate_reply(self):
+        """「🤖 AIによる返答生成」: 匿名化後プレビューの文章 + 「どういう返信をしたいか」欄の
+        内容 + プロンプトテンプレート(reply_prompt_template.txt)を組み立て、Geminiに
+        送信して返信文の案を生成する。外部に送るのはあくまで匿名化後の文章のみ。
+        """
+        anonymized_text = self.preview_box.get("1.0", "end-1c")
+        if not anonymized_text.strip():
+            messagebox.showinfo(
+                "確認",
+                "匿名化後プレビューが空です。先に「プレビュー更新」を押してください。",
+            )
+            return
+
+        if self._gemini_busy:
+            messagebox.showinfo("確認", "既にGemini APIに問い合わせ中です。完了するまでお待ちください。")
+            return
+
+        reply_intent = self.reply_intent_box.get("1.0", "end-1c")
+
+        self._gemini_busy = True
+        self.btn_generate_reply.configure(state="disabled")
+        self.set_status("Gemini APIに問い合わせ中...")
+
+        def worker():
+            try:
+                result = gemini_client.generate_reply(anonymized_text, reply_intent)
+                error = None
+            except gemini_client.GeminiError as e:
+                result, error = None, str(e)
+            self.after(0, lambda: self._on_generate_reply_done(result, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_generate_reply_done(
+        self, result: "gemini_client.GeminiReplyResult | None", error: str | None
+    ):
+        self._gemini_busy = False
+        self.btn_generate_reply.configure(state="normal")
+
+        if error:
+            self.set_status(f"AIによる返答生成エラー: {error}")
+            messagebox.showwarning("AIによる返答生成エラー", error)
+            return
+
+        # 生成結果(タグ付きのまま)を②タブの「AIによる返信案(匿名化)」欄に自動反映し、
+        # そのまま匿名化解除まで自動実行する(ユーザーがボタンを押す手間を省く)。
+        # on_deanonymize側が解除結果の詳細なステータスを表示するので、ここでは
+        # 上書きせずタブ切替・反映のみ行う。
+        self.tabview.set("② 匿名化解除")
+        self.deanon_input_box.delete("1.0", "end")
+        self.deanon_input_box.insert("1.0", result.text)
+        self._update_deanon_sources(result.sources, result.search_queries)
+        self.on_deanonymize()
+
+    def _set_deanon_sources_text(self, text: str):
+        self.deanon_sources_box.configure(state="normal")
+        self.deanon_sources_box.delete("1.0", "end")
+        self.deanon_sources_box.insert("1.0", text)
+        self.deanon_sources_box.configure(state="disabled")
+
+    def _update_deanon_sources(self, sources: list, search_queries: list[str]):
+        """AIによる返答生成の結果、Google検索によるグラウンディングで実際に参照した
+        Webページ(根拠)があれば一覧表示する。検索が行われなかった場合はその旨を表示する。
+        """
+        if not sources:
+            self._set_deanon_sources_text(
+                "(この返信案の作成にあたり、Web検索による根拠確認は行われませんでした)"
+            )
+            return
+
+        lines = []
+        if search_queries:
+            lines.append("検索クエリ: " + " / ".join(search_queries))
+            lines.append("")
+        lines.append("参照した情報源:")
+        for i, s in enumerate(sources, start=1):
+            lines.append(f"{i}. {s.title}\n   {s.uri}")
+        self._set_deanon_sources_text("\n".join(lines))
+
     def _refresh_deanon_ref_sheet(self):
         rows = self._pull_rows_from_sheet()
         data = [[r["original"], r["replacement"], r["type"]] for r in rows]
         self.deanon_ref_sheet.set_sheet_data(data, reset_col_positions=False, reset_row_positions=True)
         self.deanon_ref_sheet.set_all_column_widths()
 
-    def on_deanonymize(self):
+    def on_deanonymize(self) -> bool:
+        """戻り値: 匿名化解除後プレビューを実際に更新できたかどうか
+        (on_create_reply_mailが、この後に引用を追記してよいか判断するのに使う)。
+        """
         self._refresh_deanon_ref_sheet()
         encoded_text = self.deanon_input_box.get("1.0", "end-1c")
         if not encoded_text.strip():
-            messagebox.showinfo("確認", "匿名化されたテキストが空です。")
-            return
+            messagebox.showinfo("確認", "「AIによる返信案(匿名化)」欄が空です。")
+            return False
 
         rows = self._pull_rows_from_sheet()
         mapping = {r["original"]: r["replacement"] for r in rows if r["replacement"]}
         if not mapping:
             messagebox.showinfo("確認", "対応表が空です。①タブで対応表を作成してから実行してください。")
-            return
+            return False
 
         rev_mapping = reverse_mapping(mapping)
         result = apply_mapping(encoded_text, rev_mapping)
+
+        signature = _load_signature()
+        if signature:
+            result = f"{result}\n\n{signature}"
 
         self.deanon_preview_box.configure(state="normal")
         self.deanon_preview_box.delete("1.0", "end")
@@ -710,6 +878,84 @@ class PiiAnonymizerApp(ctk.CTk):
                 f"対応表({len(rev_mapping)}件)のタグが入力テキスト中に見つかりませんでした。"
                 "対応表とタグ付きテキストの組み合わせを確認してください。"
             )
+        return True
+
+    def on_create_reply_mail(self):
+        """「返信メール作成」: 匿名化解除後プレビューを最新の対応表・返信案で作り直した
+        うえで、Outlook標準の「返信」(引用を自動生成)を使い、その本文の先頭に
+        この返信案を差し込んだ状態でOutlookの作成画面を開く。
+        ①メール取得でOutlookから取得したメールに対してのみ実行できる
+        (元のメールをOutlook側で再度特定する必要があるため)。
+        送信は行わない。内容の確認・編集・送信はOutlook上でユーザー自身が行う。
+        """
+        if not self.on_deanonymize():
+            return
+
+        mail = self._fetched_mail
+        if not mail or not mail.get("entry_id"):
+            messagebox.showinfo(
+                "確認",
+                "①タブの「①メール取得」でOutlookから取得したメールに対してのみ、"
+                "引用返信を作成できます。",
+            )
+            return
+
+        if self._outlook_busy:
+            messagebox.showinfo("確認", "既にOutlookで返信メールを作成中です。完了するまでお待ちください。")
+            return
+
+        reply_body = self.deanon_preview_box.get("1.0", "end-1c")
+
+        self._outlook_busy = True
+        self.btn_create_reply_mail.configure(state="disabled")
+        self.set_status("Outlookで引用返信を作成中...")
+
+        def on_done():
+            self.after(0, self._on_create_reply_mail_done)
+
+        def on_error(msg):
+            self.after(0, lambda: self._on_create_reply_mail_error(msg))
+
+        outlook_client.create_quoted_reply_async(
+            mail["entry_id"], mail["store_id"], reply_body, on_done, on_error
+        )
+
+    def _on_create_reply_mail_done(self):
+        self._outlook_busy = False
+        self.btn_create_reply_mail.configure(state="normal")
+        self.set_status("Outlookで引用返信を作成しました(内容を確認のうえ送信してください)。")
+
+    def _on_create_reply_mail_error(self, msg: str):
+        self._outlook_busy = False
+        self.btn_create_reply_mail.configure(state="normal")
+        self.set_status(f"引用返信の作成エラー: {msg}")
+        messagebox.showwarning("引用返信の作成エラー", msg)
+
+    def on_clear_all(self):
+        """「削除」: 対応表を含め、①②タブのテキストエリアをすべて空の状態に戻す
+        (1件のメール対応が終わり、次のメールに取り掛かる前のリセット用)。
+        """
+        self.source_box.delete("1.0", "end")
+        self.reply_intent_box.delete("1.0", "end")
+
+        self.preview_box.configure(state="normal")
+        self.preview_box.delete("1.0", "end")
+        self.preview_box.configure(state="disabled")
+
+        self.rows = []
+        self._refresh_sheet_from_rows()
+        self._refresh_deanon_ref_sheet()
+
+        self.deanon_input_box.delete("1.0", "end")
+
+        self.deanon_preview_box.configure(state="normal")
+        self.deanon_preview_box.delete("1.0", "end")
+        self.deanon_preview_box.configure(state="disabled")
+
+        self._set_deanon_sources_text("(まだAIによる返答生成は実行されていません)")
+
+        self._fetched_mail = None
+        self.set_status("すべてのテキストエリアと対応表をクリアしました。")
 
     def on_prepare_model(self):
         repo_id = self.repo_entry.get().strip() or local_llm.DEFAULT_REPO_ID

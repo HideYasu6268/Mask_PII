@@ -14,3 +14,8 @@ pywin32>=306; sys_platform == "win32"
 spacy>=3.7.0
 ginza
 ja-ginza
+
+# Gemini API(「AIによる返答生成」機能。匿名化後の文章のみを送信する)。
+# Google検索によるグラウンディング(Tool(google_search=GoogleSearch()))を
+# 使うため、それに対応したバージョンを指定
+google-genai>=1.0.0
