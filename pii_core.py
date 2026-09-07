@@ -12,6 +12,7 @@ GUIに依存しないPII検出・適用ロジック。
 from __future__ import annotations
 
 import csv
+import io
 import re
 import sys
 from dataclasses import dataclass
@@ -179,7 +180,12 @@ def reverse_mapping(mapping: dict[str, str]) -> dict[str, str]:
     return {replacement: original for original, replacement in mapping.items() if replacement}
 
 
-DICTIONARY_HEADERS = ["元の値", "匿名化後", "種別"]
+DICTIONARY_HEADERS = ["元の値", "種別"]
+# 「匿名化後」(タグ)は元々この列に記録していたが、タグの連番はセッション
+# (対応表)ごとに振り直されるだけで、検出ロジック(detect_from_dictionary)側も
+# 「元の値」と「種別」しか参照していなかった。そのため異なる値が別セッションで
+# 同じタグ番号になる(例: [PERSON_1]が複数人に使われる)ことがあり、記録として
+# 紛らわしいだけで実質使われていなかったため、そもそも記録自体をやめた。
 # 非エンジニアがExcelでそのまま開く前提のため、日本語Windows既定のShift-JIS
 # (cp932)で読み書きする。BOMは存在しない文字コードなので、追記のたびに
 # 開き直してもutf-8-sigのような重複BOM問題は起きない。
@@ -189,7 +195,9 @@ DICTIONARY_ENCODING = "cp932"
 def load_master_dictionary(path: str | Path) -> dict[str, dict[str, str]]:
     """マスター辞書CSV(蓄積型)を読み込み、「元の値」をキーにした辞書で返す。
 
-    ファイルが存在しない場合は空辞書を返す。
+    ファイルが存在しない場合は空辞書を返す。旧形式(「匿名化後」列を含む3列)の
+    ファイルも、その列を無視するだけで読み込める(migrate_dictionary_file_if_needed
+    で新形式に書き換えるまでの間も壊れずに動作する)。
     """
     path = Path(path)
     if not path.exists():
@@ -202,23 +210,98 @@ def load_master_dictionary(path: str | Path) -> dict[str, dict[str, str]]:
             if not original:
                 continue
             entries[original] = {
-                "replacement": (row.get("匿名化後") or "").strip(),
                 "type": (row.get("種別") or "").strip(),
             }
     return entries
 
 
+def parse_dictionary_csv_text(text: str) -> dict[str, dict[str, str]]:
+    """CSVテキスト(ファイルではなく文字列)を、load_master_dictionaryと同じ形式
+    (「元の値」をキーにした辞書)で読み込む。exeに埋め込んだ初期値の辞書
+    (_EMBEDDED_DICTIONARY_CSV)を、辞書編集ウィンドウの表計算(tksheet)に
+    初期表示する際に使う。
+    """
+    entries: dict[str, dict[str, str]] = {}
+    reader = csv.DictReader(io.StringIO(text))
+    for row in reader:
+        original = (row.get("元の値") or "").strip()
+        if not original:
+            continue
+        entries[original] = {
+            "type": (row.get("種別") or "").strip(),
+        }
+    return entries
+
+
+def save_master_dictionary(rows: list[tuple[str, str]], path: str | Path) -> list[str]:
+    """マスター辞書CSV全体を、(元の値, 種別)のペア一覧で上書き保存する。
+
+    辞書編集ウィンドウ(表計算形式、main*.pyのon_edit_dictionary参照)からの
+    「保存」で使う。追記専用のappend_to_master_dictionaryと異なり、行の削除・
+    並べ替え・種別の書き換えも含めて全体をそのまま反映する。
+    「元の値」が空の行は無視し、同じ「元の値」が複数あれば後に書かれた方を
+    優先する(load_master_dictionaryの読み込み方針と揃える)。
+    Shift-JISに存在しない文字を含む行は1行ずつ捕捉してスキップし、
+    他の行の保存は継続する。
+
+    戻り値: 文字コードの都合で保存できずスキップした「元の値」のリスト
+    """
+    path = Path(path)
+    deduped: dict[str, str] = {}
+    for original, type_ in rows:
+        original = (original or "").strip()
+        if not original:
+            continue
+        deduped[original] = (type_ or "").strip() or "OTHER"
+
+    skipped: list[str] = []
+    with path.open("w", encoding=DICTIONARY_ENCODING, newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(DICTIONARY_HEADERS)
+        for original, type_ in deduped.items():
+            try:
+                writer.writerow([original, type_])
+            except UnicodeEncodeError:
+                skipped.append(original)
+    return skipped
+
+
+def migrate_dictionary_file_if_needed(path: str | Path) -> None:
+    """マスター辞書CSVが旧形式(「元の値,匿名化後,種別」の3列)のままなら、
+    新形式(「元の値,種別」の2列)に書き換える。
+
+    append_to_master_dictionary は新形式のヘッダーで追記するため、旧形式の
+    ファイルに追記すると列数が食い違ったCSVになってしまう。そのため
+    アプリ起動時に一度呼び出しておく想定(main*.py参照)。
+    """
+    path = Path(path)
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    with path.open("r", encoding=DICTIONARY_ENCODING, newline="") as f:
+        header = next(csv.reader(f), None)
+    if header == DICTIONARY_HEADERS:
+        return  # 既に新形式
+    entries = load_master_dictionary(path)
+    with path.open("w", encoding=DICTIONARY_ENCODING, newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(DICTIONARY_HEADERS)
+        for original, info in entries.items():
+            writer.writerow([original, info.get("type", "")])
+
+
 def append_to_master_dictionary(rows: list[dict], path: str | Path) -> tuple[int, list[str]]:
     """現在の対応表(rows)のうち、マスター辞書CSVにまだ無い「元の値」だけを追記する。
 
-    既存の値は上書きしない(タグの連番はセッションごとに振り直されるため、
-    マスター辞書側は最初に登録された内容を優先し、値そのものの蓄積に徹する)。
+    既存の値は上書きしない(マスター辞書側は最初に登録された内容を優先し、
+    値そのものの蓄積に徹する)。「匿名化後」のタグは記録しない(検出ロジックが
+    参照しないうえ、セッションごとに振り直されるだけの値のため)。
     Shift-JISに存在しない文字(一部の絵文字など)を含む値は1行ずつ捕捉して
     スキップし、他の行の追記は継続する(全体を巻き込んで失敗させない)。
 
     戻り値: (新規に追記した件数, 文字コードの都合で書き込めずスキップした「元の値」のリスト)
     """
     path = Path(path)
+    migrate_dictionary_file_if_needed(path)
     existing = load_master_dictionary(path)
     new_rows = [r for r in rows if r.get("original") and r["original"] not in existing]
     if not new_rows:
@@ -234,7 +317,7 @@ def append_to_master_dictionary(rows: list[dict], path: str | Path) -> tuple[int
             writer.writerow(DICTIONARY_HEADERS)
         for r in new_rows:
             try:
-                writer.writerow([r["original"], r.get("replacement", ""), r.get("type", "")])
+                writer.writerow([r["original"], r.get("type", "")])
             except UnicodeEncodeError:
                 skipped.append(r["original"])
                 continue

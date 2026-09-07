@@ -17,13 +17,13 @@ import threading
 # その場合のみ PropertyAccessor で実際のSMTPアドレスを取り直す。
 _PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
 
-# 「①メール取得」の相手先へ過去に送った最新メールを、送信済みフォルダの
+# 「メール取得」の相手先へ過去に送った最新メールを、送信済みフォルダの
 # 新しい順に何件まで遡って探すか。多くしすぎるとCOM経由の逐次アクセスで
 # 時間がかかるため、上限を設けて「見つからなければ諦める」設計にしている。
 DEFAULT_SENT_SCAN_LIMIT = 200
 
 # 過去の送信済みメールから拾う「宛名・挨拶」として扱う先頭の行数。
-GREETING_LINE_COUNT = 13
+GREETING_LINE_COUNT = 10
 
 
 class OutlookError(RuntimeError):
@@ -82,7 +82,14 @@ def _find_latest_sent_greeting(
             )
             if matched:
                 body = str(item.Body or "")
-                greeting = "\n".join(body.splitlines()[:GREETING_LINE_COUNT]).strip()
+                # OutlookのプレーンテキストBodyは、HTML本文の段落と段落の間に
+                # (中身が無い)空の段落を挟んでいることが多く、それが変換時に
+                # 「半角スペース1文字だけの行」として出力される。単純に行末の
+                # 空白を削るだけ(rstrip)ではこの行自体は残ってしまうため、
+                # 前後の空白を取ってから中身が空になった行はまるごと除外する。
+                lines = [line.strip() for line in body.splitlines()[:GREETING_LINE_COUNT]]
+                lines = [line for line in lines if line]
+                greeting = "\n".join(lines).strip()
                 return greeting or None
         except Exception:  # noqa: BLE001
             pass  # 1件の読み取りに失敗しても、全体を諦めずに次へ進む
@@ -257,7 +264,7 @@ def get_latest_unread_email() -> dict | None:
                 result["greeting"] = None
 
             # 取得したメールは未読のまま残さず、既読に更新しておく
-            # (次回「①メール取得」を押したときに同じメールを再取得しないようにするため)。
+            # (次回「メール取得」を押したときに同じメールを再取得しないようにするため)。
             latest.UnRead = False
             latest.Save()
             return result

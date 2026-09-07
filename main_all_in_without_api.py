@@ -30,7 +30,7 @@ exe化して配布することを想定し、それら3つの中身をこのフ�
 PII匿名化デスクトップアプリ(プロトタイプ)
 
 レイアウト(左から、各ペイン直下に関連ボタンを配置):
-  [原文入力 / メールを取得して匿名化 / 返信の方針入力欄]
+  [原文入力 / メール取得・匿名化対象を検出 / 返信の方針入力欄]
   [対応表(編集可能) / 行操作ボタン]
   [匿名化後プレビュー / 反映・AI返答ボタン]
 上部バーには「AIによる匿名化を行う」チェックボックス(既定ON。OFFなら辞書+NERのみ)と、
@@ -40,18 +40,20 @@ PII匿名化デスクトップアプリ(プロトタイプ)
 優先し、無ければ埋め込み済みの初期値(_EMBEDDED_*)を使う)がある。
 
 流れ:
-  1. 「メールを取得して匿名化」→ Outlookの受信トレイから最新の未読メール本文を
-     原文欄に入れ、続けて匿名化対象の検出(辞書突き合わせ・正規表現・NER、
-     「AIによる匿名化を行う」がONならローカルLLMでの見落とし検出も)まで自動で
-     一連の流れとして実行する(on_fetch_and_anonymize参照)。その下の
-     「どういう返信をしたいか」欄は「🤖 AIによる返答生成」(未実装)向けに、
-     返信の方針を書いておく任意入力欄
-  2. 対応表は自由に編集可能(「+ 手動で行追加」した行は種別=OTHERでタグが仮に入る)。
+  1. 「メール取得」→ Outlookの受信トレイから最新の未読メール本文を原文欄に入れる
+     (または左端に原文を手動で入力/貼り付け)。
+  2. 「匿名化対象を検出」→ 辞書突き合わせ・正規表現・NER(常時使用)、
+     「AIによる匿名化を行う」がONならローカルLLMでの見落とし検出も行う
+     (on_detect_all参照)。メール取得とは別ボタンにしてあるのは、引用返信の
+     多いメールだと検出対象が膨らみ処理も重くなるため、必要なタイミングで
+     手動で実行できるようにするため。その下の「どういう返信をしたいか」欄は
+     「🤖 AIによる返答生成」(未実装)向けに、返信の方針を書いておく任意入力欄
+  3. 対応表は自由に編集可能(「+ 手動で行追加」した行は種別=OTHERでタグが仮に入る)。
      「🏷 タグを割当」→ 種別が未確定(OTHER)の行を、ローカルLLMがPERSON/ORG/
      LOCATION等に判定し、タグも判定後の種別に振り直す
-  3. 「プレビュー更新」→ 対応表を原文に適用し、右端にプレビュー表示
+  4. 「プレビュー更新」→ 対応表を原文に適用し、右端にプレビュー表示
      (対応表の新規の値はマスター辞書pii_dictionary.csvにも蓄積される)
-  4. 「🤖 AIによる返答生成」は未実装のプレースホルダー(今後実装予定)
+  5. 「🤖 AIによる返答生成」は未実装のプレースホルダー(今後実装予定)
 
 すべてローカル完結。ネットワーク通信はモデルの初回ダウンロード時のみ。
 """
@@ -71,7 +73,7 @@ from tksheet import Sheet
 from pii_core import (
     detect_pii, merge_llm_items, build_placeholder_mapping, apply_mapping,
     reverse_mapping, append_to_master_dictionary, load_master_dictionary,
-    detect_from_dictionary, PiiItem,
+    detect_from_dictionary, migrate_dictionary_file_if_needed, PiiItem,
 )
 import gemini_client
 import local_llm
@@ -96,6 +98,9 @@ _APP_DIR = (
 # プレビュー更新のたびに、対応表の内容(元の値・匿名化後・種別)を蓄積していく
 # マスター辞書CSV。既知の値は上書きせず追記のみ(pii_core.append_to_master_dictionary参照)。
 MASTER_DICTIONARY_PATH = _APP_DIR / "pii_dictionary.csv"
+# 過去バージョンで作られた旧形式(「元の値,匿名化後,種別」の3列)のファイルが
+# 残っていれば、追記時に列がずれないよう新形式(「元の値,種別」の2列)に書き換えておく。
+migrate_dictionary_file_if_needed(MASTER_DICTIONARY_PATH)
 
 # 署名編集ボタン(on_edit_signature)の保存先。ファイルが無ければ_EMBEDDED_SIGNATURE
 # を使う(_load_signature参照)。gemini_client.PROMPT_TEMPLATE_PATH / API_KEY_PATH も
@@ -239,7 +244,7 @@ class PiiAnonymizerApp(ctk.CTk):
         # 独立するだけ)だが、同じボタンの連打で問い合わせが重複するのを防ぐ。
         self._gemini_busy = False
 
-        # 「メールを取得して匿名化」で最後に取得したメール
+        # 「メール取得」で最後に取得したメール
         # ({"subject","sender","body","received","entry_id","store_id"})。
         # 「返信メール作成」がOutlook側でこのメールを再度特定し、標準の「返信」
         # (引用を自動生成)を作るのに使う。手動入力時など未取得の場合はNoneのままで、
@@ -339,15 +344,20 @@ class PiiAnonymizerApp(ctk.CTk):
         self.source_box = ctk.CTkTextbox(left, wrap="word")
         self.source_box.pack(fill="both", expand=True, padx=8, pady=(0, 4))
 
-        # 非エンジニア向けに、旧「①メール取得」→「匿名化対象を検出」の2ボタン操作を
-        # 1ボタンの一連の流れにまとめる(on_fetch_and_anonymize参照)。
+        # 引用返信の多いメールだと辞書突き合わせ・NER等の匿名化対象検出に時間が
+        # かかり、対応表も膨らみやすいため、「メール取得」と「匿名化対象を検出」は
+        # あえて別ボタンにして、必要なタイミングで検出を実行できるようにする。
+        # CTkButtonは既定でwidth=140(最小幅)を取り、sticky="ew"でも下限としては
+        # 効き続ける。2個並ぶと280px超がペインの最小要求幅になり、weight比による
+        # 分配(2:1:3)より最小幅の要求が上回って比率が崩れるため、明示的に狭める。
         left_btn_row = ctk.CTkFrame(left, fg_color="transparent")
         left_btn_row.pack(fill="x", padx=8, pady=(0, 8))
-        left_btn_row.grid_columnconfigure(0, weight=1)
-        self.btn_fetch_and_anonymize = ctk.CTkButton(
-            left_btn_row, text="メールを取得して匿名化", width=1,
-            command=self.on_fetch_and_anonymize)
-        self.btn_fetch_and_anonymize.grid(row=0, column=0, sticky="ew")
+        left_btn_row.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkButton(left_btn_row, text="メール取得", width=1,
+                      command=self.on_fetch_mail).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self.btn_detect_all = ctk.CTkButton(left_btn_row, text="匿名化対象を検出", width=1,
+                      command=self.on_detect_all)
+        self.btn_detect_all.grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
         # 「🤖 AIによる返答生成」(現状未実装)向けに、どんな返信をしたいかを
         # あらかじめ書いておくスペース。原文欄より小さい固定高さにとどめ、
@@ -549,7 +559,7 @@ class PiiAnonymizerApp(ctk.CTk):
             )
             return False
         self._llm_busy = True
-        self.btn_fetch_and_anonymize.configure(state="disabled")
+        self.btn_detect_all.configure(state="disabled")
         self.btn_llm_classify.configure(state="disabled")
         self._llm_progress_start = time.monotonic()
         self._tick_llm_progress()
@@ -557,7 +567,7 @@ class PiiAnonymizerApp(ctk.CTk):
 
     def _llm_call_end(self):
         self._llm_busy = False
-        self.btn_fetch_and_anonymize.configure(state="normal")
+        self.btn_detect_all.configure(state="normal")
         self.btn_llm_classify.configure(state="normal")
         self._llm_progress_start = None
         if self._llm_progress_after_id is not None:
@@ -688,66 +698,39 @@ class PiiAnonymizerApp(ctk.CTk):
     # ------------------------------------------------------------------
     # イベントハンドラ
     # ------------------------------------------------------------------
-    def on_fetch_and_anonymize(self):
-        """「メールを取得して匿名化」: 旧「①メール取得」→「匿名化対象を検出」の
-        2ボタン操作を、非エンジニアが迷わず使えるよう1ボタンの一連の流れにまとめたもの。
-        Outlookの受信トレイから最新の未読メール本文を原文欄に入れ、続けて
-        匿名化対象の検出(on_detect_all)まで自動で行う。
+    def on_fetch_mail(self):
+        """「メール取得」: Outlookの受信トレイから最新の未読メール本文を原文欄に入れる。
+        「匿名化対象を検出」は別ボタンにしてあり、ここでは自動実行しない
+        (引用返信の多いメールだと検出対象が膨らみ処理も重くなるため、
+        検出は必要なタイミングで手動で行えるようにする)。
         """
-        if self._llm_busy:
-            messagebox.showinfo("確認", "既にローカルLLMで処理中です。完了するまでお待ちください。")
-            return
-        self.btn_fetch_and_anonymize.configure(state="disabled")
         self.set_status("Outlookから未読メールを取得中...")
 
         def on_done(mail):
-            self.after(0, lambda: self._on_fetch_and_anonymize_done(mail))
+            self.after(0, lambda: self._on_fetch_mail_done(mail))
 
         def on_error(msg):
             self.after(0, lambda: self._on_fetch_mail_error(msg))
 
         outlook_client.fetch_latest_unread_email_async(on_done, on_error)
 
-    def _on_fetch_and_anonymize_done(self, mail: dict | None):
+    def _on_fetch_mail_done(self, mail: dict | None):
         if mail is None:
-            # 未読メールが無い場合でも、原文欄に手動で貼り付け済みの内容があれば
-            # それをそのまま使って検出まで進める(警告不要)。原文欄も空の場合のみ
-            # 「原文が無い」ことを案内して中断する。
-            # 手動入力の原文は、以前取得したメールとは無関係のため、返信メール作成が
-            # 誤って古いメールへの引用返信を作らないよう_fetched_mailはクリアする。
-            self._fetched_mail = None
-            text = self.source_box.get("1.0", "end-1c")
-            if not text.strip():
-                self.btn_fetch_and_anonymize.configure(state="normal")
-                self.set_status("未読メールが見つからず、原文欄も空です。")
-                messagebox.showinfo(
-                    "確認",
-                    "未読メールが見つからず、原文欄も空です。"
-                    "原文を入力するか、Outlookに未読メールがある状態でお試しください。",
-                )
-                return
-            self.set_status("未読メールは見つかりませんでしたが、原文欄の内容で匿名化対象を検出します...")
-            self.on_detect_all()
+            self.set_status("未読メールが見つかりませんでした。")
+            messagebox.showinfo("確認", "未読メールが見つかりませんでした。")
             return
-
         self.source_box.delete("1.0", "end")
         self.source_box.insert("1.0", mail["body"])
         self._fetched_mail = mail
-        self.set_status(
-            f"未読メールを取得しました(件名: {mail['subject']} / 差出人: {mail['sender']})。"
-            "続けて匿名化対象を検出します..."
-        )
-        # ボタンの再有効化はon_detect_all側の各終了地点(_llm_call_end等)に任せる。
-        self.on_detect_all()
+        self.set_status(f"未読メールを取得しました(件名: {mail['subject']} / 差出人: {mail['sender']})。")
 
     def _on_fetch_mail_error(self, msg: str):
-        self.btn_fetch_and_anonymize.configure(state="normal")
         self.set_status(f"メール取得エラー: {msg}")
         messagebox.showwarning("メール取得エラー", msg)
 
     def on_detect_all(self):
-        """辞書突き合わせ・正規表現/NER・(チェックボックスがONなら)ローカルLLMを、
-        非エンジニアが手法を意識しなくて済むよう一連の流れとしてまとめて実行する。
+        """「匿名化対象を検出」: 辞書突き合わせ・正規表現/NER・(チェックボックスがONなら)
+        ローカルLLMを、非エンジニアが手法を意識しなくて済むよう一連の流れとしてまとめて実行する。
         NER(人名/組織名)は常時使う。ローカルLLMによる追加検出は
         「AIによる匿名化を行う」チェックボックスがONの場合のみ実行する
         (辞書が育つほどAIの出番は減っていく想定のため、OFFで辞書+NERのみにできる)。
@@ -756,7 +739,6 @@ class PiiAnonymizerApp(ctk.CTk):
         """
         text = self.source_box.get("1.0", "end-1c")
         if not text.strip():
-            self.btn_fetch_and_anonymize.configure(state="normal")
             messagebox.showinfo("確認", "原文が空です。")
             return
 
@@ -765,7 +747,6 @@ class PiiAnonymizerApp(ctk.CTk):
         except Exception as e:  # noqa: BLE001
             # 正規表現/NER検出は同期処理(GUIスレッド上)なので、ここで想定外の
             # 例外が起きてもアプリごと落とさず、エラー内容を表示して継続する。
-            self.btn_fetch_and_anonymize.configure(state="normal")
             self.set_status(f"検出中にエラーが発生しました: {e}")
             messagebox.showwarning("検出エラー", str(e))
             return
@@ -778,7 +759,6 @@ class PiiAnonymizerApp(ctk.CTk):
         added_sync = self._append_items_as_rows(dict_items + regex_ner_items)
 
         if not self.use_ai_var.get():
-            self.btn_fetch_and_anonymize.configure(state="normal")
             self.set_status(
                 f"辞書一致{len(dict_items)}件・正規表現/NER {len(regex_ner_items)}件のうち"
                 f"{added_sync}件を追加。(「AIによる匿名化を行う」がオフのためAI検出はスキップしました)"
@@ -786,7 +766,6 @@ class PiiAnonymizerApp(ctk.CTk):
             return
 
         if not self._llm_call_begin():
-            self.btn_fetch_and_anonymize.configure(state="normal")
             self.set_status(
                 f"辞書一致{len(dict_items)}件・正規表現/NER {len(regex_ner_items)}件のうち"
                 f"{added_sync}件を追加。(ローカルLLMは他の処理が完了するまでスキップしました)"
@@ -1053,8 +1032,8 @@ class PiiAnonymizerApp(ctk.CTk):
         rev_mapping = reverse_mapping(mapping)
         result = apply_mapping(encoded_text, rev_mapping)
 
-        # ①メール取得時に、相手への過去の送信済みメールから拾えていれば、
-        # その宛名・挨拶(先頭7行、実名を含む)をここでローカルに先頭へ差し込む。
+        # メール取得時に、相手への過去の送信済みメールから拾えていれば、
+        # その宛名・挨拶(先頭10行、実名を含む)をここでローカルに先頭へ差し込む。
         # 署名と同様、Geminiには一切送信しない(on_generate_replyの送信対象は
         # あくまで匿名化後の文章のみで、この処理はその後段でのみ行われる)。
         greeting = (self._fetched_mail or {}).get("greeting")
@@ -1085,7 +1064,7 @@ class PiiAnonymizerApp(ctk.CTk):
         """「返信メール作成」: 匿名化解除後プレビューを最新の対応表・返信案で作り直した
         うえで、Outlook標準の「返信」(引用を自動生成)を使い、その本文の先頭に
         この返信案を差し込んだ状態でOutlookの作成画面を開く。
-        「メールを取得して匿名化」でOutlookから取得したメールに対してのみ実行できる
+        「メール取得」でOutlookから取得したメールに対してのみ実行できる
         (元のメールをOutlook側で再度特定する必要があるため)。
         送信は行わない。内容の確認・編集・送信はOutlook上でユーザー自身が行う。
         """
@@ -1096,7 +1075,7 @@ class PiiAnonymizerApp(ctk.CTk):
         if not mail or not mail.get("entry_id"):
             messagebox.showinfo(
                 "確認",
-                "①タブの「メールを取得して匿名化」でOutlookから取得したメールに対してのみ、"
+                "①タブの「メール取得」でOutlookから取得したメールに対してのみ、"
                 "引用返信を作成できます。",
             )
             return
