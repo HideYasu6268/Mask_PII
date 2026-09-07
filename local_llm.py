@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import threading
 
 
@@ -26,7 +27,15 @@ DEFAULT_FILENAME = "Qwen2.5-7B-Instruct-Q4_K_M.gguf"
 # モデルはHuggingFaceの共有キャッシュ(~/.cache/huggingface/hub)ではなく、
 # 配布のしやすさを優先してプロジェクト直下の models/ フォルダに配置する。
 # フォルダごとコピーすれば、コピー先PCはネットに繋がず動かせる。
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+# PyInstallerでexe化した場合、__file__はexeの実体とは別の展開先(onefileなら
+# 起動のたびに消える一時フォルダ)を指してしまうため、frozen時はexe自身の
+# あるフォルダを基準にする(でないとmodels/がexe再起動のたびに再ダウンロードに
+# なったり、消える一時フォルダに書き込まれたりする)。
+APP_DIR = (
+    os.path.dirname(os.path.abspath(sys.executable))
+    if getattr(sys, "frozen", False)
+    else os.path.dirname(os.path.abspath(__file__))
+)
 MODELS_DIR = os.path.join(APP_DIR, "models")
 
 ALLOWED_TYPES = ["PERSON", "ORG", "LOCATION", "EMAIL", "PHONE",

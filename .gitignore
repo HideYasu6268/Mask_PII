@@ -14,11 +14,16 @@ ENV/
 build/
 dist/
 *.egg-info/
+*.exe
 
 # Environment / secrets
 .env
 .env.*
 gemini_api_key.txt
+
+# main_all_in.pyはexe配布用にAPIキー・署名の実値を埋め込んで使うため、
+# git管理外にする(実値を含まないサンプルはmain_all_in_no_api.pyを参照)。
+main_all_in.py
 
 # Models (large binary files)
 models/

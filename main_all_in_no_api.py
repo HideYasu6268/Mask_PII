@@ -1,6 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-main.py
+main_all_in_no_api.py
+
+main_all_in.py(exe配布用バリアント)の、Gemini APIキー・署名・プロンプトの
+"実際の値"を含まないgitコミット用サンプル。main_all_in.py自体は
+下記_EMBEDDED_*にAPIキー等の実値を書き込んで使うため、実値入りのまま
+git管理すると秘密情報がリポジトリに残ってしまう(GitHubのpush protectionにも
+実際に検出・ブロックされた)。そのため、main_all_in.py は.gitignore対象にして
+ローカルにのみ置き(実値入り)、こちらのno_api版を代わりにコミットして
+構成・実装の参照用として残す。
+
+exeを実際にビルドする際は、main_all_in.py(このファイルをコピーし、
+下記_EMBEDDED_SIGNATURE / _EMBEDDED_PROMPT_TEMPLATE / _EMBEDDED_API_KEYSを
+実際の署名.txt / reply_prompt_template.txt / gemini_api_key.txtの中身に
+書き換えたもの)をPyInstallerに渡すこと。
+
+main.pyは開発時の使い勝手を優先してプロンプトテンプレート・署名・
+Gemini APIキーを外部ファイル(reply_prompt_template.txt / 署名.txt /
+gemini_api_key.txt)から都度読み込むが、main_all_in.pyはPyInstaller等で
+exe化して配布することを想定し、それら3つの中身をこのファイル自体に埋め込み、
+外部ファイルが無くても単体で動作するようにしてある(_EMBEDDED_*定数、
+および末尾のgemini_client差し替え箇所を参照)。
+
+注意: Gemini APIキーをexeに埋め込むと、実行ファイルを文字列検索(strings等)
+されるだけでキーが読み取れてしまう。難読化はしていない(そもそも実行時に
+展開する以上、真の秘匿にはならないため)。配布先を信頼できる範囲に限る、
+配布後も定期的にキーをローテーションする、といった運用でリスクを抑えること。
 
 PII匿名化デスクトップアプリ(プロトタイプ)
 
@@ -9,8 +34,10 @@ PII匿名化デスクトップアプリ(プロトタイプ)
   [対応表(編集可能) / 行操作ボタン]
   [匿名化後プレビュー / 反映・AI返答ボタン]
 上部バーには「AIによる匿名化を行う」チェックボックス(既定ON。OFFなら辞書+NERのみ)と、
-右上に「署名」「Geminiへのプロンプト」「APIキー」の編集ボタン(非エンジニアがコードや
-外部ファイルを直接触らずに内容を書き換えられる、_open_edit_window参照)がある。
+右上に「署名」「Geminiへのプロンプト」「APIキー」の編集ボタン(非エンジニアがexeや
+コードを直接触らずに内容を書き換えられる、_open_edit_window参照。保存先は
+署名.txt / reply_prompt_template.txt / gemini_api_key.txtで、存在すればそちらを
+優先し、無ければ埋め込み済みの初期値(_EMBEDDED_*)を使う)がある。
 
 流れ:
   1. 「メールを取得して匿名化」→ Outlookの受信トレイから最新の未読メール本文を
@@ -31,6 +58,7 @@ PII匿名化デスクトップアプリ(プロトタイプ)
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 import tkinter as tk
@@ -55,23 +83,128 @@ ctk.set_default_color_theme("blue")
 
 SHEET_HEADERS = ["元の値", "匿名化後", "種別"]
 
+# PyInstallerでexe化した場合、__file__はexeの実体とは別の展開先(onefileなら
+# 起動のたびに消える一時フォルダ)を指してしまうため、frozen時はexe自身の
+# あるフォルダを基準にする(でないと辞書CSV/署名/上書き設定がexe再起動のたびに
+# 消えてしまう)。gemini_client.py / local_llm.py 側にも同様の分岐がある。
+_APP_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+
 # プレビュー更新のたびに、対応表の内容(元の値・匿名化後・種別)を蓄積していく
 # マスター辞書CSV。既知の値は上書きせず追記のみ(pii_core.append_to_master_dictionary参照)。
-MASTER_DICTIONARY_PATH = Path(__file__).resolve().parent / "pii_dictionary.csv"
+MASTER_DICTIONARY_PATH = _APP_DIR / "pii_dictionary.csv"
 
-# 匿名化解除後の返信文の末尾に付ける署名。ファイルが無ければ単に付けない
-# (必須ではない)。呼び出しのたびに読み直すので、アプリを再起動しなくても
-# 内容の変更がすぐ反映される。
-SIGNATURE_PATH = Path(__file__).resolve().parent / "署名.txt"
+# 署名編集ボタン(on_edit_signature)の保存先。ファイルが無ければ_EMBEDDED_SIGNATURE
+# を使う(_load_signature参照)。gemini_client.PROMPT_TEMPLATE_PATH / API_KEY_PATH も
+# 同様に「あれば優先、無ければ埋め込み済みの初期値」というフォールバックにする
+# (_load_prompt_template_with_fallback / _load_api_keys_with_fallback参照)。
+SIGNATURE_PATH = _APP_DIR / "署名.txt"
+
+# ------------------------------------------------------------------
+# exe単体でも初回から動作するよう埋め込んだ、本来は外部ファイルの初期値
+# (署名・プロンプトテンプレート・Gemini APIキー)。GUI上の編集ボタン
+# (on_edit_signature等)で保存すると、上記の外部ファイルとして書き出され、
+# 以後はそちらが優先される(このファイルの値は「外部ファイルが無い場合の
+# 初期値」という位置づけになる)。
+# ------------------------------------------------------------------
+
+# ここには署名.txtの実際の中身(名前・住所・電話番号等)を貼る。
+# このファイル(main_all_in_no_api.py)はgitにコミットするため、ダミー値のままにしておくこと。
+_EMBEDDED_SIGNATURE = """(署名.txtの内容をここに貼り付けてください)"""
+
+_EMBEDDED_PROMPT_TEMPLATE = """あなたは会計事務所に勤務するスタッフとして、クライアントへのメール返信文を作成する
+アシスタントです。やり取りの内容は基本的に会計・税務に関するものです。
+
+以下の「匿名化された原文」は、個人情報が [TYPE_連番] という形式のタグ
+(例: [PERSON_1], [EMAIL_1])に置き換えられています。
+返信文を作成する際は、これらのタグを与えられた表記のまま使ってください
+(タグの中身を推測して具体的な値に書き換えたり、タグ自体を省略したりしないこと)。
+
+# 宛先・差出人の扱い(重要、間違えやすいので必ず確認すること)
+- 「匿名化された原文」は、あなた(会計事務所スタッフ)が受け取ったメールの本文
+  そのものです。冒頭に宛名(文頭に単独で書かれた人名など)がある場合、それは
+  原文の「受信者」、つまりあなた自身を指しており、これから書く返信の宛先では
+  ありません。末尾に署名(名前・組織名)がある場合、それはその原文を送ってきた
+  「差出人」であり、返信を送るべき相手です。返信文はこの差出人を宛先として
+  書いてください。
+- ただし、宛名や署名が無い、あるいは形式的でない原文もあります。決まった位置
+  だけで機械的に判断せず、本文の内容・文脈全体から実際の受信者/差出人がどちらか
+  を都度判断すること。
+- いずれにせよ、原文の宛名・署名をそのまま使い回して、結果的に自分自身(原文の
+  受信者)に返信するような文面には絶対にしないこと。宛先と差出人を取り違えて
+  いないか、返信文を作る前に原文を読み直して確認すること。
+
+# 回答方針
+- 原文が「資料を受け取りました」「内容を確認しました」といった単純な確認・お礼のみで
+  完結する内容であれば、それに見合ったシンプルな返信文にとどめること
+  (無理に税務的な調査や根拠の提示を付け加えない)。
+- 一方、税務・会計についての具体的な質問が含まれる場合は、国税庁の公表資料・TKC・
+  税理士が作成したWebページなど、信頼できる情報源の内容を踏まえて回答すること。
+- 調査した結論が相手の希望や期待に沿わない内容になる場合でも、遠慮せずその結論を伝え、
+  必ずその根拠(法令・通達・情報源など)を明示すること。
+- 根拠を示した後、反証となりうる情報(異なる見解・例外規定など)がないかをもう一度
+  調べ直し、見つかった場合は回答に反映すること。
+
+# 返信の方針(ユーザー指定)
+{reply_intent}
+
+# 匿名化された原文
+{anonymized_text}
+
+上記を踏まえて、日本語のビジネスメールの返信文の本文のみを出力してください。
+件名・署名(名前・組織名を含む結びの一文)・前置きの説明文は不要です。
+"""
+
+# gemini_client._load_api_keys()と同じ形式(1行1キー)。上から順に試し、
+# レート制限(429)に達したら次のキーへ自動フォールバックする(gemini_client.py参照)。
+# ここには実際のAPIキーを書かないこと(このファイルはgitにコミットするため)。
+_EMBEDDED_API_KEYS = [
+    "YOUR_API_KEY_HERE",
+]
+
+# gemini_client.pyは本来 gemini_api_key.txt / reply_prompt_template.txt を
+# ファイルから読み込むが、exe単体でも初回から動作させるため、読み込み関数を
+# 「外部ファイルがあればそちらを使い(GUIの編集ボタンで保存された内容を反映)、
+# 無ければ埋め込み済みの初期値を使う」ものに差し替える(gemini_client.py自体は
+# 他にも変更点なく共有できるため、ファイルは書き換えない)。
+_original_load_api_keys = gemini_client._load_api_keys
+_original_load_prompt_template = gemini_client._load_prompt_template
+
+
+def _load_api_keys_with_fallback() -> list[str]:
+    if Path(gemini_client.API_KEY_PATH).is_file():
+        try:
+            return _original_load_api_keys()
+        except gemini_client.GeminiError:
+            pass  # ファイルはあるが空/仮の値のみ等 → 埋め込み済みの初期値にフォールバック
+    return list(_EMBEDDED_API_KEYS)
+
+
+def _load_prompt_template_with_fallback() -> str:
+    if Path(gemini_client.PROMPT_TEMPLATE_PATH).is_file():
+        try:
+            return _original_load_prompt_template()
+        except gemini_client.GeminiError:
+            pass
+    return _EMBEDDED_PROMPT_TEMPLATE
+
+
+gemini_client._load_api_keys = _load_api_keys_with_fallback
+gemini_client._load_prompt_template = _load_prompt_template_with_fallback
 
 
 def _load_signature() -> str:
-    if not SIGNATURE_PATH.is_file():
-        return ""
-    try:
-        return SIGNATURE_PATH.read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
+    if SIGNATURE_PATH.is_file():
+        try:
+            text = SIGNATURE_PATH.read_text(encoding="utf-8").strip()
+            if text:
+                return text
+        except OSError:
+            pass
+    return _EMBEDDED_SIGNATURE.strip()
 
 
 class PiiAnonymizerApp(ctk.CTk):
@@ -106,7 +239,7 @@ class PiiAnonymizerApp(ctk.CTk):
         # 独立するだけ)だが、同じボタンの連打で問い合わせが重複するのを防ぐ。
         self._gemini_busy = False
 
-        # 「①メール取得」で最後に取得したメール
+        # 「メールを取得して匿名化」で最後に取得したメール
         # ({"subject","sender","body","received","entry_id","store_id"})。
         # 「返信メール作成」がOutlook側でこのメールを再度特定し、標準の「返信」
         # (引用を自動生成)を作るのに使う。手動入力時など未取得の場合はNoneのままで、
@@ -952,7 +1085,7 @@ class PiiAnonymizerApp(ctk.CTk):
         """「返信メール作成」: 匿名化解除後プレビューを最新の対応表・返信案で作り直した
         うえで、Outlook標準の「返信」(引用を自動生成)を使い、その本文の先頭に
         この返信案を差し込んだ状態でOutlookの作成画面を開く。
-        ①メール取得でOutlookから取得したメールに対してのみ実行できる
+        「メールを取得して匿名化」でOutlookから取得したメールに対してのみ実行できる
         (元のメールをOutlook側で再度特定する必要があるため)。
         送信は行わない。内容の確認・編集・送信はOutlook上でユーザー自身が行う。
         """
@@ -963,7 +1096,7 @@ class PiiAnonymizerApp(ctk.CTk):
         if not mail or not mail.get("entry_id"):
             messagebox.showinfo(
                 "確認",
-                "①タブの「①メール取得」でOutlookから取得したメールに対してのみ、"
+                "①タブの「メールを取得して匿名化」でOutlookから取得したメールに対してのみ、"
                 "引用返信を作成できます。",
             )
             return
@@ -1051,8 +1184,11 @@ class PiiAnonymizerApp(ctk.CTk):
         local_llm.preload_model_async(repo_id, filename, on_done, on_error)
 
     # ------------------------------------------------------------------
-    # 署名・Geminiへのプロンプト・APIキーの編集(非エンジニアがコード/CSVを直接
-    # 触らずに済むよう、GUI上の簡単なテキスト編集ウィンドウとして提供する)
+    # 署名・Geminiへのプロンプト・APIキーの編集(非エンジニアがexeやコードを直接
+    # 触らずに済むよう、GUI上の簡単なテキスト編集ウィンドウとして提供する)。
+    # 保存先は署名.txt / reply_prompt_template.txt / gemini_api_key.txtで、
+    # 存在すればそちらを優先し、無ければ埋め込み済みの初期値(_EMBEDDED_*)を使う
+    # (_load_signature / _load_api_keys_with_fallback / _load_prompt_template_with_fallback参照)。
     # ------------------------------------------------------------------
     def _open_edit_window(self, title: str, initial_text: str, on_save):
         """titleをタイトルバーに、initial_textを内容にしたテキスト編集ウィンドウを
@@ -1096,7 +1232,7 @@ class PiiAnonymizerApp(ctk.CTk):
 
     def on_edit_prompt_template(self):
         path = Path(gemini_client.PROMPT_TEMPLATE_PATH)
-        current = path.read_text(encoding="utf-8") if path.is_file() else ""
+        current = path.read_text(encoding="utf-8") if path.is_file() else _EMBEDDED_PROMPT_TEMPLATE
 
         def save(text: str):
             try:
@@ -1112,7 +1248,7 @@ class PiiAnonymizerApp(ctk.CTk):
 
     def on_edit_api_key(self):
         path = Path(gemini_client.API_KEY_PATH)
-        current = path.read_text(encoding="utf-8") if path.is_file() else ""
+        current = path.read_text(encoding="utf-8") if path.is_file() else "\n".join(_EMBEDDED_API_KEYS)
 
         def save(text: str):
             try:

@@ -150,14 +150,36 @@ def _insert_reply_body(reply, reply_body: str) -> None:
             r'[^"\']*?margin-bottom:\s*([^;"\']+)',
             original_html,
         )
-        style_attr = f' style="margin-bottom:{margin_match.group(2)}"' if margin_match else ""
+        margin_style = f"margin-bottom:{margin_match.group(2)};" if margin_match else ""
+        style_attr = f' style="{margin_style}font-size:11.0pt"'
         lines = escaped.split("\n")
         html_fragment = "".join(
             f'<p class="MsoNormal"{style_attr}>{line or "&nbsp;"}</p>' for line in lines
         )
         html_fragment += f'<p class="MsoNormal"{style_attr}>&nbsp;</p>'
     else:
-        html_fragment = escaped.replace("\n", "<br>\n") + "<br><br>\n"
+        # MsoNormalクラスが無い場合、フォント指定をしないとブラウザ既定フォント
+        # (Times New Roman相当)になり、Outlookの本文フォント設定(游ゴシック等)と
+        # 食い違って見えるため、明示的にフォントを指定しておく。
+        # 単に font-family:游ゴシック とだけ書くと、Outlook上では「游ゴシック」
+        # という固定フォント指定として扱われ、フォントリボンには「游ゴシック
+        # (本文のフォント)」ではなく素の「游ゴシック」と表示されてしまう
+        # (テーマのフォントを変更してもこの部分だけ追従しない)。
+        # Wordは mso-*-theme-font:minor-latin/minor-fareast 等の指定がある
+        # 要素を「本文のフォント(テーマ追従)」として扱うため、これを併記する。
+        theme_font_style = (
+            "font-size:11.0pt;"
+            "font-family:'游ゴシック',sans-serif;"
+            "mso-ascii-font-family:游ゴシック;mso-ascii-theme-font:minor-latin;"
+            "mso-fareast-font-family:游ゴシック;mso-fareast-theme-font:minor-fareast;"
+            "mso-hansi-font-family:游ゴシック;mso-hansi-theme-font:minor-latin;"
+            "mso-bidi-font-family:游ゴシック;mso-bidi-theme-font:minor-bidi;"
+        )
+        html_fragment = (
+            f'<div style="{theme_font_style}">'
+            + escaped.replace("\n", "<br>\n")
+            + "<br><br>\n</div>"
+        )
     match_pos = original_html.lower().find("<body")
     if match_pos == -1:
         # <body>タグが見つからない異常なケースへのフォールバック。

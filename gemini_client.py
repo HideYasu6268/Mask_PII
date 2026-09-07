@@ -27,9 +27,18 @@ Google Gemini APIとの通信を行う(このアプリで唯一、外部にネ�
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+# PyInstallerでexe化した場合、__file__はexeの実体とは別の展開先(onefileなら
+# 起動のたびに消える一時フォルダ)を指してしまうため、frozen時はexe自身の
+# あるフォルダを基準にする(でないとAPIキー/プロンプトの編集内容がexe再起動の
+# たびに消えたり、意図しない場所に書き込まれたりする)。
+APP_DIR = (
+    os.path.dirname(os.path.abspath(sys.executable))
+    if getattr(sys, "frozen", False)
+    else os.path.dirname(os.path.abspath(__file__))
+)
 API_KEY_PATH = os.path.join(APP_DIR, "gemini_api_key.txt")
 PROMPT_TEMPLATE_PATH = os.path.join(APP_DIR, "reply_prompt_template.txt")
 
