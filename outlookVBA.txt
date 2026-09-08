@@ -1,0 +1,3 @@
+Sub RunMaskPII()
+    Shell "Your-exe-Adress-Here", vbNormalFocus
+End Sub
