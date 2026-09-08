@@ -3,7 +3,8 @@
 outlook_client.py
 
 ローカルにインストール・起動済みのOutlookデスクトップアプリを、pywin32(win32com)
-経由でCOM操作し、受信トレイの未読メールを取得する。Outlook自体が行う送受信を
+経由でCOM操作し、受信トレイ(および顧客ごとの仕分けフォルダ等、その配下の
+すべてのサブフォルダ)の未読メールを取得する。Outlook自体が行う送受信を
 除けば、このモジュール自身は外部通信を一切行わない(Windows専用)。
 """
 
@@ -197,8 +198,49 @@ def _insert_reply_body(reply, reply_body: str) -> None:
     reply.HTMLBody = original_html[:tag_end] + html_fragment + original_html[tag_end:]
 
 
+def _iter_unread_mail_items(folder):
+    """folder自身と、その配下のすべてのサブフォルダ(再帰的)から、未読アイテムを
+    yieldする。受信トレイ配下にOutlookのルール等で作られた顧客ごとの仕分け
+    フォルダに振り分けられたメールも拾えるようにするため。
+
+    フォルダ単位で失敗しても(検索フォルダ等の特殊フォルダで起こりうる)、
+    そのフォルダだけスキップして探索全体は続行する。
+    """
+    try:
+        unread_items = folder.Items.Restrict("[Unread] = true")
+        for i in range(1, unread_items.Count + 1):
+            yield unread_items.Item(i)
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        subfolders = folder.Folders
+        for i in range(1, subfolders.Count + 1):
+            yield from _iter_unread_mail_items(subfolders.Item(i))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _find_latest_unread_mail(folder):
+    """folder以下(自身+再帰的にすべてのサブフォルダ)の未読アイテムのうち、
+    ReceivedTimeが最も新しいものを1件返す。1件も無ければNone。
+    """
+    latest = None
+    latest_time = None
+    for item in _iter_unread_mail_items(folder):
+        try:
+            received = item.ReceivedTime
+        except Exception:  # noqa: BLE001
+            continue  # 1件の読み取りに失敗しても、全体を諦めずに次へ進む
+        if latest_time is None or received > latest_time:
+            latest = item
+            latest_time = received
+    return latest
+
+
 def get_latest_unread_email() -> dict | None:
-    """Outlookの受信トレイから、受信日時が最も新しい未読メール1件を取得する。
+    """Outlookの受信トレイ(および、顧客ごとの仕分けフォルダ等その配下の
+    すべてのサブフォルダ)から、受信日時が最も新しい未読メール1件を取得する。
     取得したメールは既読に更新する(同じメールを繰り返し取得しないようにするため)。
 
     戻り値: {"subject": str, "sender": str, "sender_email": str, "body": str,
@@ -233,12 +275,9 @@ def get_latest_unread_email() -> dict | None:
 
         try:
             inbox = namespace.GetDefaultFolder(6)  # 6 = olFolderInbox
-            items = inbox.Items
-            items.Sort("[ReceivedTime]", True)  # 新しい順に並べ替え
-            unread_items = items.Restrict("[Unread] = true")
-            if unread_items.Count == 0:
+            latest = _find_latest_unread_mail(inbox)
+            if latest is None:
                 return None
-            latest = unread_items.GetFirst()
             sender_email = _get_sender_smtp_address(latest)
             result = {
                 "subject": str(latest.Subject or ""),
