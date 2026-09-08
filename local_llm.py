@@ -109,17 +109,29 @@ def _make_progress_tqdm_class(on_progress):
     通知するtqdmサブクラスを作る。on_progressは別スレッド(ダウンロードスレッド)
     から頻繁に呼ばれるため、呼び出し元(GUI)でself.after(0, ...)を使って
     UIスレッドに戻すこと。
+
+    disable=Trueを強制し、tqdm自身によるコンソールへの描画は常に行わせない。
+    進捗はon_progress経由でGUIに表示するので不要な上、PyInstallerの
+    --windowedでビルドしたexeではsys.stdout/sys.stderrがNoneになり、
+    tqdmが素の進捗バーを描画しようとすると
+    「'NoneType' object has no attribute 'write'」で丸ごとクラッシュするため。
+    disable=True時はtqdm本体のupdate()が内部カウンタを進めなくなるので、
+    進捗の集計はここで自前に行う。
     """
     from tqdm.auto import tqdm as base_tqdm
 
     class _CallbackTqdm(base_tqdm):
+        def __init__(self, *args, **kwargs):
+            kwargs["disable"] = True
+            super().__init__(*args, **kwargs)
+            self._reported_n = self.n or 0
+
         def update(self, n=1):
-            result = super().update(n)
+            self._reported_n += n
             total = self.total
             if total:
-                percent = max(0, min(100, int(self.n * 100 / total)))
+                percent = max(0, min(100, int(self._reported_n * 100 / total)))
                 on_progress(percent)
-            return result
 
     return _CallbackTqdm
 
