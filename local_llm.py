@@ -104,11 +104,32 @@ def _local_model_path(filename: str) -> str:
     return os.path.join(MODELS_DIR, filename)
 
 
-def _ensure_model_file(repo_id: str, filename: str) -> str:
+def _make_progress_tqdm_class(on_progress):
+    """hf_hub_downloadのtqdm_classに渡す、進捗(0-100の整数%)をon_progressへ
+    通知するtqdmサブクラスを作る。on_progressは別スレッド(ダウンロードスレッド)
+    から頻繁に呼ばれるため、呼び出し元(GUI)でself.after(0, ...)を使って
+    UIスレッドに戻すこと。
+    """
+    from tqdm.auto import tqdm as base_tqdm
+
+    class _CallbackTqdm(base_tqdm):
+        def update(self, n=1):
+            result = super().update(n)
+            total = self.total
+            if total:
+                percent = max(0, min(100, int(self.n * 100 / total)))
+                on_progress(percent)
+            return result
+
+    return _CallbackTqdm
+
+
+def _ensure_model_file(repo_id: str, filename: str, on_progress=None) -> str:
     """models/ フォルダにモデルファイルがあることを保証し、ローカルパスを返す。
 
     既に存在すればネットワークには一切アクセスしない(完全オフライン)。
     無い場合のみ HuggingFace からダウンロードして models/ 直下に配置する。
+    on_progress が指定されていれば、ダウンロード進捗(0-100の整数%)を渡して呼ぶ。
     """
     local_path = _local_model_path(filename)
     if os.path.isfile(local_path):
@@ -130,6 +151,7 @@ def _ensure_model_file(repo_id: str, filename: str) -> str:
             repo_id=repo_id,
             filename=filename,
             local_dir=MODELS_DIR,
+            tqdm_class=_make_progress_tqdm_class(on_progress) if on_progress else None,
         )
     except Exception as e:  # noqa: BLE001
         raise LocalLLMError(
@@ -138,10 +160,11 @@ def _ensure_model_file(repo_id: str, filename: str) -> str:
     return downloaded_path
 
 
-def _load_model(repo_id: str, filename: str):
+def _load_model(repo_id: str, filename: str, on_progress=None):
     """モデルをロードする(ローカルに無ければHuggingFaceからダウンロードされる)。
 
     プロセス内でシングルトンとして保持し、同じ repo_id/filename なら再ロードしない。
+    on_progress が指定されていれば、初回ダウンロード時の進捗(0-100の整数%)を渡して呼ぶ。
     """
     global _llm_instance, _current_config
 
@@ -157,7 +180,7 @@ def _load_model(repo_id: str, filename: str):
                 " `pip install llama-cpp-python` を実行してください。"
             ) from e
 
-        model_path = _ensure_model_file(repo_id, filename)
+        model_path = _ensure_model_file(repo_id, filename, on_progress=on_progress)
 
         try:
             n_threads = os.cpu_count() or 4
@@ -177,17 +200,20 @@ def _load_model(repo_id: str, filename: str):
         return llm
 
 
-def preload_model_async(repo_id: str, filename: str, on_done, on_error):
+def preload_model_async(repo_id: str, filename: str, on_done, on_error, on_progress=None):
     """GUIから呼ぶ用のヘルパー。別スレッドでダウンロード+ロードし、完了をコールバックで通知する。
 
-    on_done()      : 成功時に引数なしで呼ばれる
-    on_error(msg)   : 失敗時にエラーメッセージ文字列を渡して呼ばれる
-    呼び出し元(GUI)は on_done/on_error の中で self.after(0, ...) を使って
-    UIスレッドに処理を戻すこと。
+    on_done()          : 成功時に引数なしで呼ばれる
+    on_error(msg)      : 失敗時にエラーメッセージ文字列を渡して呼ばれる
+    on_progress(pct)   : 指定時、初回ダウンロード中に進捗(0-100の整数%)を渡して呼ばれる
+                          (キャッシュ済みで再ダウンロード不要の場合は呼ばれない)
+    呼び出し元(GUI)は on_done/on_error/on_progress の中で self.after(0, ...) を
+    使ってUIスレッドに処理を戻すこと(このコールバックはダウンロードスレッドから
+    直接、かつ高頻度に呼ばれるため)。
     """
     def worker():
         try:
-            _load_model(repo_id, filename)
+            _load_model(repo_id, filename, on_progress=on_progress)
             on_done()
         except LocalLLMError as e:
             on_error(str(e))

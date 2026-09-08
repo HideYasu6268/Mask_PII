@@ -1021,13 +1021,21 @@ class PiiAnonymizerApp(ctk.CTk):
             self.set_status(f"モデル準備エラー: {msg}")
             messagebox.showwarning("モデル準備エラー", msg)
 
+        def handle_progress(percent):
+            self.set_status(
+                f"モデルをHuggingFaceからダウンロード中... ({filename}、{percent}%)"
+            )
+
         def on_done():
             self.after(0, handle_done)
 
         def on_error(msg):
             self.after(0, lambda: handle_error(msg))
 
-        local_llm.preload_model_async(repo_id, filename, on_done, on_error)
+        def on_progress(percent):
+            self.after(0, lambda: handle_progress(percent))
+
+        local_llm.preload_model_async(repo_id, filename, on_done, on_error, on_progress=on_progress)
 
     # ------------------------------------------------------------------
     # 署名・Geminiへのプロンプト・APIキーの編集(非エンジニアがコード/CSVを直接
