@@ -55,47 +55,104 @@ def _get_recipient_smtp_address(recipient) -> str:
         return addr
 
 
-def _find_latest_sent_greeting(
-    namespace, sender_email: str, max_scan: int = DEFAULT_SENT_SCAN_LIMIT
-) -> str | None:
-    """送信済みメールを送信日時の新しい順に最大max_scan件まで見て、
-    sender_email宛てに送った最新のメールを探し、本文の先頭GREETING_LINE_COUNT行
-    (宛名・挨拶部分だと想定)を返す。見つからなければNone
-    (呼び出し元は「宛名・挨拶なし」にフォールバックすること)。
-    """
-    target = sender_email.strip().lower()
-    if not target:
-        return None
+def _get_current_user_smtp_address(namespace) -> str:
+    """現在ログイン中の自分自身のSMTPアドレスを取り出す(ベストエフォート)。"""
+    try:
+        return _get_recipient_smtp_address(namespace.CurrentUser).strip().lower()
+    except Exception:  # noqa: BLE001
+        return ""
 
-    sent_folder = namespace.GetDefaultFolder(5)  # 5 = olFolderSentMail
-    items = sent_folder.Items
-    items.Sort("[SentOn]", True)  # 新しい順
+
+def _scan_folder_for_sent_item(folder, target: str, my_address: str, max_scan: int):
+    """folder(単一フォルダ、非再帰)を送信日時の新しい順に最大max_scan件まで見て、
+    target宛てに自分から送った最新のメールを探す。(item, SentOn) のタプル、
+    見つからなければNoneを返す。
+
+    my_addressを指定した場合、差出人が自分自身でないアイテムは除外する
+    (受信メールと自分の送信控えが混在するフォルダを検索する際、受信メールを
+    誤って「送った相手」として拾わないようにするため)。
+    """
+    try:
+        items = folder.Items
+        items.Sort("[SentOn]", True)  # 新しい順
+    except Exception:  # noqa: BLE001
+        return None
 
     scanned = 0
     item = items.GetFirst()
     while item is not None and scanned < max_scan:
         scanned += 1
         try:
+            if my_address and _get_sender_smtp_address(item).strip().lower() != my_address:
+                item = items.GetNext()
+                continue
             recipients = item.Recipients
             matched = any(
                 _get_recipient_smtp_address(recipients.Item(i)).strip().lower() == target
                 for i in range(1, recipients.Count + 1)
             )
             if matched:
-                body = str(item.Body or "")
-                # OutlookのプレーンテキストBodyは、HTML本文の段落と段落の間に
-                # (中身が無い)空の段落を挟んでいることが多く、それが変換時に
-                # 「半角スペース1文字だけの行」として出力される。単純に行末の
-                # 空白を削るだけ(rstrip)ではこの行自体は残ってしまうため、
-                # 前後の空白を取ってから中身が空になった行はまるごと除外する。
-                lines = [line.strip() for line in body.splitlines()[:GREETING_LINE_COUNT]]
-                lines = [line for line in lines if line]
-                greeting = "\n".join(lines).strip()
-                return greeting or None
+                return item, getattr(item, "SentOn", None)
         except Exception:  # noqa: BLE001
             pass  # 1件の読み取りに失敗しても、全体を諦めずに次へ進む
         item = items.GetNext()
     return None
+
+
+def _find_latest_sent_greeting(
+    namespace, sender_email: str, source_folder=None, max_scan: int = DEFAULT_SENT_SCAN_LIMIT
+) -> str | None:
+    """sender_email宛てに自分から送った最新のメールを探し、本文の先頭
+    GREETING_LINE_COUNT行(宛名・挨拶部分だと想定)を返す。見つからなければNone
+    (呼び出し元は「宛名・挨拶なし」にフォールバックすること)。
+
+    既定の送信済みフォルダに加えて、source_folder(通常はメール取得元の
+    フォルダ)も検索対象にする。受信トレイ配下に顧客ごとの仕分けフォルダを
+    作り、そこに受信メールだけでなく自分の送信控えも一緒に移して管理する
+    運用があるため。両方で見つかった場合はより新しい方を採用する。
+    """
+    target = sender_email.strip().lower()
+    if not target:
+        return None
+
+    sent_folder = namespace.GetDefaultFolder(5)  # 5 = olFolderSentMail
+    candidates = []
+
+    found = _scan_folder_for_sent_item(sent_folder, target, my_address="", max_scan=max_scan)
+    if found is not None:
+        candidates.append(found)
+
+    if source_folder is not None:
+        try:
+            same_folder = source_folder.EntryID == sent_folder.EntryID
+        except Exception:  # noqa: BLE001
+            same_folder = False
+        if not same_folder:
+            my_address = _get_current_user_smtp_address(namespace)
+            found = _scan_folder_for_sent_item(
+                source_folder, target, my_address=my_address, max_scan=max_scan
+            )
+            if found is not None:
+                candidates.append(found)
+
+    if not candidates:
+        return None
+
+    best_item, best_sent_on = candidates[0]
+    for item, sent_on in candidates[1:]:
+        if best_sent_on is None or (sent_on is not None and sent_on > best_sent_on):
+            best_item, best_sent_on = item, sent_on
+
+    body = str(best_item.Body or "")
+    # OutlookのプレーンテキストBodyは、HTML本文の段落と段落の間に
+    # (中身が無い)空の段落を挟んでいることが多く、それが変換時に
+    # 「半角スペース1文字だけの行」として出力される。単純に行末の
+    # 空白を削るだけ(rstrip)ではこの行自体は残ってしまうため、
+    # 前後の空白を取ってから中身が空になった行はまるごと除外する。
+    lines = [line.strip() for line in body.splitlines()[:GREETING_LINE_COUNT]]
+    lines = [line for line in lines if line]
+    greeting = "\n".join(lines).strip()
+    return greeting or None
 
 
 def _insert_reply_body(reply, reply_body: str) -> None:
@@ -248,8 +305,9 @@ def get_latest_unread_email() -> dict | None:
              "greeting": str | None}
     entry_id/store_idは、後から create_quoted_reply() でこの同じメールを
     Outlook側から再度特定し、Outlook標準の引用返信を作成するために使う。
-    greetingは、差出人(sender_email)へ過去に送った送信済みメールのうち
-    最新のものの先頭GREETING_LINE_COUNT行(宛名・挨拶だと想定)。見つからない場合はNone
+    greetingは、差出人(sender_email)へ過去に送った最新のメール(既定の送信済み
+    フォルダ、および取得元フォルダ自体に送信控えが移されている場合はそちらも
+    対象)の先頭GREETING_LINE_COUNT行(宛名・挨拶だと想定)。見つからない場合はNone
     (ベストエフォートのため、取得できなくてもメール取得自体は失敗させない)。
     未読メールが1件も無い場合は None を返す。
     Outlookが未インストール/未起動、またはCOM操作に失敗した場合は OutlookError。
@@ -297,7 +355,9 @@ def get_latest_unread_email() -> dict | None:
             # あくまで補助情報なので、取得に失敗してもメール取得自体は失敗させない。
             try:
                 result["greeting"] = (
-                    _find_latest_sent_greeting(namespace, sender_email) if sender_email else None
+                    _find_latest_sent_greeting(namespace, sender_email, source_folder=latest.Parent)
+                    if sender_email
+                    else None
                 )
             except Exception:  # noqa: BLE001
                 result["greeting"] = None
