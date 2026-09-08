@@ -341,8 +341,9 @@ class PiiAnonymizerApp(ctk.CTk):
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
         ctk.CTkLabel(left, text="原文(ここに入力・貼り付け)", font=ctk.CTkFont(weight="bold")
                      ).pack(anchor="w", padx=8, pady=(8, 2))
-        self.source_box = ctk.CTkTextbox(left, wrap="word")
+        self.source_box = ctk.CTkTextbox(left, wrap="word", undo=True, autoseparators=True, maxundo=-1)
         self.source_box.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        self._setup_undo_redo(self.source_box)
 
         # 引用返信の多いメールだと辞書突き合わせ・NER等の匿名化対象検出に時間が
         # かかり、対応表も膨らみやすいため、「メール取得」と「匿名化対象を検出」は
@@ -435,6 +436,37 @@ class PiiAnonymizerApp(ctk.CTk):
             command=self.on_generate_reply)
         self.btn_generate_reply.grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
+    def _setup_undo_redo(self, textbox: ctk.CTkTextbox):
+        """テキストボックスに、Ctrl+Z/Ctrl+Yおよび右クリックメニューからの
+        「元に戻す」「やり直し」を追加する(textbox生成時にundo=Trueが必要)。
+        """
+        def undo(event=None):
+            try:
+                textbox.edit_undo()
+            except tk.TclError:
+                pass  # 戻す履歴が無い場合(何もしない)
+            return "break"
+
+        def redo(event=None):
+            try:
+                textbox.edit_redo()
+            except tk.TclError:
+                pass  # 進む履歴が無い場合(何もしない)
+            return "break"
+
+        textbox.bind("<Control-z>", undo)
+        textbox.bind("<Control-y>", redo)
+
+        menu = tk.Menu(textbox, tearoff=False)
+        menu.add_command(label="元に戻す (Ctrl+Z)", command=undo)
+        menu.add_command(label="やり直し (Ctrl+Y)", command=redo)
+
+        def show_menu(event):
+            menu.tk_popup(event.x_root, event.y_root)
+            return "break"
+
+        textbox.bind("<Button-3>", show_menu)
+
     def _on_anonymize_area_resize(self, event):
         # CTkFrameは.bind()を内部キャンバスへ委譲するためevent.widget/event.width
         # は信用できない。必ずareaそのものから実測する。
@@ -471,8 +503,9 @@ class PiiAnonymizerApp(ctk.CTk):
         left.grid(row=1, column=0, sticky="nsew", padx=(0, 4))
         ctk.CTkLabel(left, text="匿名化解除後プレビュー", font=ctk.CTkFont(weight="bold")
                      ).pack(anchor="w", padx=8, pady=(8, 2))
-        self.deanon_preview_box = ctk.CTkTextbox(left, wrap="word")
+        self.deanon_preview_box = ctk.CTkTextbox(left, wrap="word", undo=True, autoseparators=True, maxundo=-1)
         self.deanon_preview_box.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        self._setup_undo_redo(self.deanon_preview_box)
         self.deanon_preview_box.configure(state="disabled")
 
         deanon_btn_row = ctk.CTkFrame(left, fg_color="transparent")
