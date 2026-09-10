@@ -99,6 +99,23 @@ def _scan_folder_for_sent_item(folder, target: str, my_address: str, max_scan: i
     return None
 
 
+def _iter_folder_and_subfolders(folder):
+    """folder自身と、その配下のすべてのサブフォルダ(再帰的)をyieldする。
+    送信済みフォルダの配下に顧客ごとの仕分けフォルダを作って送信控えを
+    整理している運用があるため、そういったサブフォルダも辿れるようにする。
+
+    フォルダ単位で失敗しても(検索フォルダ等の特殊フォルダで起こりうる)、
+    そのフォルダだけスキップして探索全体は続行する。
+    """
+    yield folder
+    try:
+        subfolders = folder.Folders
+        for i in range(1, subfolders.Count + 1):
+            yield from _iter_folder_and_subfolders(subfolders.Item(i))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _find_latest_sent_greeting(
     namespace, sender_email: str, source_folder=None, max_scan: int = DEFAULT_SENT_SCAN_LIMIT
 ) -> str | None:
@@ -106,10 +123,12 @@ def _find_latest_sent_greeting(
     GREETING_LINE_COUNT行(宛名・挨拶部分だと想定)を返す。見つからなければNone
     (呼び出し元は「宛名・挨拶なし」にフォールバックすること)。
 
-    既定の送信済みフォルダに加えて、source_folder(通常はメール取得元の
-    フォルダ)も検索対象にする。受信トレイ配下に顧客ごとの仕分けフォルダを
-    作り、そこに受信メールだけでなく自分の送信控えも一緒に移して管理する
-    運用があるため。両方で見つかった場合はより新しい方を採用する。
+    既定の送信済みフォルダ(および、その配下に顧客ごとの仕分けフォルダを
+    作って送信控えを整理している運用に対応するため、配下の全サブフォルダも
+    再帰的に)に加えて、source_folder(通常はメール取得元のフォルダ)も
+    検索対象にする。受信トレイ配下に顧客ごとの仕分けフォルダを作り、そこに
+    受信メールだけでなく自分の送信控えも一緒に移して管理する運用がある
+    ため。複数で見つかった場合はより新しい方を採用する。
     """
     target = sender_email.strip().lower()
     if not target:
@@ -118,9 +137,10 @@ def _find_latest_sent_greeting(
     sent_folder = namespace.GetDefaultFolder(5)  # 5 = olFolderSentMail
     candidates = []
 
-    found = _scan_folder_for_sent_item(sent_folder, target, my_address="", max_scan=max_scan)
-    if found is not None:
-        candidates.append(found)
+    for folder in _iter_folder_and_subfolders(sent_folder):
+        found = _scan_folder_for_sent_item(folder, target, my_address="", max_scan=max_scan)
+        if found is not None:
+            candidates.append(found)
 
     if source_folder is not None:
         try:
@@ -306,8 +326,9 @@ def get_latest_unread_email() -> dict | None:
     entry_id/store_idは、後から create_quoted_reply() でこの同じメールを
     Outlook側から再度特定し、Outlook標準の引用返信を作成するために使う。
     greetingは、差出人(sender_email)へ過去に送った最新のメール(既定の送信済み
-    フォルダ、および取得元フォルダ自体に送信控えが移されている場合はそちらも
-    対象)の先頭GREETING_LINE_COUNT行(宛名・挨拶だと想定)。見つからない場合はNone
+    フォルダおよびその配下の全サブフォルダ、および取得元フォルダ自体に送信控えが
+    移されている場合はそちらも対象)の先頭GREETING_LINE_COUNT行(宛名・挨拶だと想定)。
+    見つからない場合はNone
     (ベストエフォートのため、取得できなくてもメール取得自体は失敗させない)。
     未読メールが1件も無い場合は None を返す。
     Outlookが未インストール/未起動、またはCOM操作に失敗した場合は OutlookError。
