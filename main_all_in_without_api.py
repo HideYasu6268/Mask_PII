@@ -1,26 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-main_all_in_no_api.py
+main_all_in_without_api.py
 
-main_all_in.py(exe配布用バリアント)の、Gemini APIキー・署名・プロンプトの
+main_all_in.py(exe配布用バリアント)の、APIキー・署名・マスター辞書の
 "実際の値"を含まないgitコミット用サンプル。main_all_in.py自体は
 下記_EMBEDDED_*にAPIキー等の実値を書き込んで使うため、実値入りのまま
-git管理すると秘密情報がリポジトリに残ってしまう(GitHubのpush protectionにも
-実際に検出・ブロックされた)。そのため、main_all_in.py は.gitignore対象にして
-ローカルにのみ置き(実値入り)、こちらのno_api版を代わりにコミットして
-構成・実装の参照用として残す。
+git管理すると秘密情報がリポジトリに残ってしまう。そのため、main_all_in.py は
+.gitignore対象にしてローカルにのみ置き(実値入り)、こちらのwithout_api版を代わりに
+コミットして構成・実装の参照用として残す。
 
-exeを実際にビルドする際は、main_all_in.py(このファイルをコピーし、
-下記_EMBEDDED_SIGNATURE / _EMBEDDED_PROMPT_TEMPLATE / _EMBEDDED_API_KEYSを
-実際の署名.txt / reply_prompt_template.txt / gemini_api_key.txtの中身に
-書き換えたもの)をPyInstallerに渡すこと。
+exe配布のエントリはこのファイル(main_all_in_without_api.py)とする。
+PyInstaller(PII_Anonymizer_Tool.spec)はプロンプト(_EMBEDDED_PROMPT_TEMPLATES)だけを
+exeに入れ、APIキー・マスター辞書・署名の実値は同梱しない。
+実キーや実辞書を埋め込みたい場合のみ、ローカル専用のmain_all_in.pyを使うこと。
 
-main.pyは開発時の使い勝手を優先してプロンプトテンプレート・署名・
-Gemini APIキーを外部ファイル(reply_prompt_template.txt / 署名.txt /
-gemini_api_key.txt)から都度読み込むが、main_all_in.pyはPyInstaller等で
-exe化して配布することを想定し、それら3つの中身をこのファイル自体に埋め込み、
-外部ファイルが無くても単体で動作するようにしてある(_EMBEDDED_*定数、
-および末尾のgemini_client差し替え箇所を参照)。
+
+main.pyのexe配布用バリアント。main.pyは開発時の使い勝手を優先して
+プロンプトテンプレート・署名・Gemini APIキーを外部ファイル
+(reply_prompt_template.txt / 署名.txt / gemini_api_key.txt)から
+都度読み込むが、このファイルはPyInstaller等でexe化して配布することを
+想定し、それら3つの中身をこのファイル自体に埋め込み、外部ファイルが
+無くても単体で動作するようにしてある(_EMBEDDED_*定数、および末尾の
+gemini_client差し替え箇所を参照)。
 
 注意: Gemini APIキーをexeに埋め込むと、実行ファイルを文字列検索(strings等)
 されるだけでキーが読み取れてしまう。難読化はしていない(そもそも実行時に
@@ -34,10 +35,10 @@ PII匿名化デスクトップアプリ(プロトタイプ)
   [対応表(編集可能) / 行操作ボタン]
   [匿名化後プレビュー / 反映・AI返答ボタン]
 上部バーには「AIによる匿名化を行う」チェックボックス(既定ON。OFFなら辞書+NERのみ)と、
-右上に「署名」「Geminiへのプロンプト」「APIキー」の編集ボタン(非エンジニアがexeや
+右上に「辞書」「署名」「Geminiへのプロンプト」「APIキー」の編集ボタン(非エンジニアがexeや
 コードを直接触らずに内容を書き換えられる、_open_edit_window参照。保存先は
-署名.txt / reply_prompt_template.txt / gemini_api_key.txtで、存在すればそちらを
-優先し、無ければ埋め込み済みの初期値(_EMBEDDED_*)を使う)がある。
+pii_dictionary.csv / 署名.txt / reply_prompt_template.txt / gemini_api_key.txtで、
+存在すればそちらを優先し、無ければ埋め込み済みの初期値(_EMBEDDED_*)を使う)がある。
 
 流れ:
   1. 「メール取得」→ Outlookの受信トレイから最新の未読メール本文を原文欄に入れる
@@ -73,7 +74,8 @@ from tksheet import Sheet
 from pii_core import (
     detect_pii, merge_llm_items, build_placeholder_mapping, apply_mapping,
     reverse_mapping, append_to_master_dictionary, load_master_dictionary,
-    detect_from_dictionary, migrate_dictionary_file_if_needed, PiiItem,
+    detect_from_dictionary, migrate_dictionary_file_if_needed,
+    parse_dictionary_csv_text, save_master_dictionary, PiiItem,
 )
 import gemini_client
 import local_llm
@@ -98,9 +100,6 @@ _APP_DIR = (
 # プレビュー更新のたびに、対応表の内容(元の値・匿名化後・種別)を蓄積していく
 # マスター辞書CSV。既知の値は上書きせず追記のみ(pii_core.append_to_master_dictionary参照)。
 MASTER_DICTIONARY_PATH = _APP_DIR / "pii_dictionary.csv"
-# 過去バージョンで作られた旧形式(「元の値,匿名化後,種別」の3列)のファイルが
-# 残っていれば、追記時に列がずれないよう新形式(「元の値,種別」の2列)に書き換えておく。
-migrate_dictionary_file_if_needed(MASTER_DICTIONARY_PATH)
 
 # 署名編集ボタン(on_edit_signature)の保存先。ファイルが無ければ_EMBEDDED_SIGNATURE
 # を使う(_load_signature参照)。gemini_client.PROMPT_TEMPLATE_PATH / API_KEY_PATH も
@@ -117,10 +116,56 @@ SIGNATURE_PATH = _APP_DIR / "署名.txt"
 # ------------------------------------------------------------------
 
 # ここには署名.txtの実際の中身(名前・住所・電話番号等)を貼る。
-# このファイル(main_all_in_no_api.py)はgitにコミットするため、ダミー値のままにしておくこと。
+# このファイル(main_all_in_without_api.py)はgitにコミットするため、ダミー値のままにしておくこと。
 _EMBEDDED_SIGNATURE = """(署名.txtの内容をここに貼り付けてください)"""
 
-_EMBEDDED_PROMPT_TEMPLATE = """あなたは会計事務所に勤務するスタッフとして、クライアントへのメール返信文を作成する
+# プロンプトテンプレートはスタイル別に3種類埋め込む(gemini_client.PROMPT_STYLES参照)。
+# 外部ファイル(reply_prompt_short.txt / reply_prompt_template.txt /
+# reply_prompt_long_search.txt)が存在すればそちらを優先し、無ければここの値を使う
+# (_load_prompt_template_with_fallback参照)。
+_EMBEDDED_PROMPT_TEMPLATES: dict[str, str] = {
+    "short": """あなたは会計事務所に勤務するスタッフとして、クライアントへの短い確認・お礼メールの
+返信文を作成するアシスタントです。今回のやり取りは、資料の受領確認・お礼・日程調整
+など、簡潔な返信で十分な内容だと判断されています。
+
+以下の「匿名化された原文」は、個人情報が [TYPE_連番] という形式のタグ
+(例: [PERSON_1], [EMAIL_1])に置き換えられています。
+返信文を作成する際は、これらのタグを与えられた表記のまま使ってください
+(タグの中身を推測して具体的な値に書き換えたり、タグ自体を省略したりしないこと)。
+
+# 宛先・差出人の扱い(重要、間違えやすいので必ず確認すること)
+- 「匿名化された原文」は、あなた(会計事務所スタッフ)が受け取ったメールの本文
+  そのものです。冒頭に宛名(文頭に単独で書かれた人名など)がある場合、それは
+  原文の「受信者」、つまりあなた自身を指しており、これから書く返信の宛先では
+  ありません。末尾に署名(名前・組織名)がある場合、それはその原文を送ってきた
+  「差出人」であり、返信を送るべき相手です。返信文はこの差出人を宛先として
+  書いてください。
+- ただし、宛名や署名が無い、あるいは形式的でない原文もあります。決まった位置
+  だけで機械的に判断せず、本文の内容・文脈全体から実際の受信者/差出人がどちらか
+  を都度判断すること。
+- いずれにせよ、原文の宛名・署名をそのまま使い回して、結果的に自分自身(原文の
+  受信者)に返信するような文面には絶対にしないこと。宛先と差出人を取り違えて
+  いないか、返信文を作る前に原文を読み直して確認すること。
+
+# 回答方針
+- 用件に対して簡潔に応答することを最優先し、必要以上に調査や説明を付け加えないこと
+  (Web検索は、原文の内容を正しく理解する上でどうしても必要な場合を除き行わないこと)。
+- 相手が書いた内容に対する確認・お礼・簡単な返答を、2〜4文程度の短い本文にまとめる
+  こと。定型的な言い回しで構わない。
+- 万一、原文に税務・会計についての具体的な質問が含まれていた場合は、無理に簡潔さを
+  優先せず、質問に答えるために必要な範囲でのみ調査・説明を加えること
+  (単純な確認だけの内容だという前提が崩れる場合は、その限りではない)。
+
+# 返信の方針(ユーザー指定)
+{reply_intent}
+
+# 匿名化された原文
+{anonymized_text}
+
+上記を踏まえて、日本語のビジネスメールの返信文の本文のみを出力してください。
+件名・署名(名前・組織名を含む結びの一文)・前置きの説明文は不要です。
+""",
+    "standard": """あなたは会計事務所に勤務するスタッフとして、クライアントへのメール返信文を作成する
 アシスタントです。やり取りの内容は基本的に会計・税務に関するものです。
 
 以下の「匿名化された原文」は、個人情報が [TYPE_連番] という形式のタグ
@@ -161,14 +206,79 @@ _EMBEDDED_PROMPT_TEMPLATE = """あなたは会計事務所に勤務するスタ�
 
 上記を踏まえて、日本語のビジネスメールの返信文の本文のみを出力してください。
 件名・署名(名前・組織名を含む結びの一文)・前置きの説明文は不要です。
-"""
+""",
+    "long_search": """あなたは会計事務所に勤務するスタッフとして、クライアントへのメール返信文を作成する
+アシスタントです。今回のやり取りには税務・会計についての具体的な質問・相談が含まれて
+おり、根拠を明示した上で、丁寧かつ詳しい返信文を作成する必要があると判断されています。
+
+以下の「匿名化された原文」は、個人情報が [TYPE_連番] という形式のタグ
+(例: [PERSON_1], [EMAIL_1])に置き換えられています。
+返信文を作成する際は、これらのタグを与えられた表記のまま使ってください
+(タグの中身を推測して具体的な値に書き換えたり、タグ自体を省略したりしないこと)。
+
+# 宛先・差出人の扱い(重要、間違えやすいので必ず確認すること)
+- 「匿名化された原文」は、あなた(会計事務所スタッフ)が受け取ったメールの本文
+  そのものです。冒頭に宛名(文頭に単独で書かれた人名など)がある場合、それは
+  原文の「受信者」、つまりあなた自身を指しており、これから書く返信の宛先では
+  ありません。末尾に署名(名前・組織名)がある場合、それはその原文を送ってきた
+  「差出人」であり、返信を送るべき相手です。返信文はこの差出人を宛先として
+  書いてください。
+- ただし、宛名や署名が無い、あるいは形式的でない原文もあります。決まった位置
+  だけで機械的に判断せず、本文の内容・文脈全体から実際の受信者/差出人がどちらか
+  を都度判断すること。
+- いずれにせよ、原文の宛名・署名をそのまま使い回して、結果的に自分自身(原文の
+  受信者)に返信するような文面には絶対にしないこと。宛先と差出人を取り違えて
+  いないか、返信文を作る前に原文を読み直して確認すること。
+
+# 回答方針
+- 必ずGoogle検索によるグラウンディングを使い、国税庁の公表資料・TKC・税理士が
+  作成したWebページなど、信頼できる情報源の内容を踏まえて回答すること
+  (検索を省略しないこと)。
+- 調査した結論が相手の希望や期待に沿わない内容になる場合でも、遠慮せずその結論を伝え、
+  必ずその根拠(法令・通達・情報源など)を明示すること。
+- 根拠を示した後、反証となりうる情報(異なる見解・例外規定など)がないかをもう一度
+  調べ直し、見つかった場合は回答に反映すること。
+- 簡潔さよりも、相手が安心して理解できることを優先し、背景説明・具体例・注意点を
+  丁寧に盛り込んだ、通常よりも長めの文章にすること。ただし、冗長な前置きの繰り返しや、
+  同じ内容の言い換えの重複は避けること。
+- 文末・言い回しは特に丁寧なビジネス敬語を用いること。
+
+# 返信の方針(ユーザー指定)
+{reply_intent}
+
+# 匿名化された原文
+{anonymized_text}
+
+上記を踏まえて、日本語のビジネスメールの返信文の本文のみを出力してください。
+件名・署名(名前・組織名を含む結びの一文)・前置きの説明文は不要です。
+""",
+}
+
+# 後方互換用(on_edit_prompt_template等、"standard"テンプレートを直接参照している
+# 箇所向けの単一テンプレート)。
+_EMBEDDED_PROMPT_TEMPLATE = _EMBEDDED_PROMPT_TEMPLATES["standard"]
 
 # gemini_client._load_api_keys()と同じ形式(1行1キー)。上から順に試し、
 # レート制限(429)に達したら次のキーへ自動フォールバックする(gemini_client.py参照)。
+# gskで始まるキーはGroq API(openai/gpt-oss-20b)、その他はGemini APIを使用する。
 # ここには実際のAPIキーを書かないこと(このファイルはgitにコミットするため)。
 _EMBEDDED_API_KEYS = [
     "YOUR_API_KEY_HERE",
 ]
+
+# 配布時点のpii_dictionary.csv(cp932保存)の中身。exeと同じフォルダにまだ
+# pii_dictionary.csvが無い初回起動時だけ、これを書き出して種にする
+# (_seed_master_dictionary_if_missing参照)。2回目以降はそちらのファイルが
+# そのまま使われ、通常通り追記・蓄積されていく。
+# 「元の値,種別」の2列のみ(旧「匿名化後」列は、検出ロジックが参照しない
+# うえセッションごとに振り直されるだけの値だったため廃止。
+# pii_core.migrate_dictionary_file_if_needed参照)。
+# 注意: クライアントの実名・住所・電話番号等が入っているため、このファイルは
+# 事務所内など、内容を見られてよい相手にのみ配布すること。
+# 注意: このファイル(main_all_in_without_api.py)はgitにコミットするため、
+# クライアントの実名等を含めずヘッダーのみにしておくこと。
+_EMBEDDED_DICTIONARY_CSV = """元の値,種別
+"""
 
 # gemini_client.pyは本来 gemini_api_key.txt / reply_prompt_template.txt を
 # ファイルから読み込むが、exe単体でも初回から動作させるため、読み込み関数を
@@ -188,13 +298,18 @@ def _load_api_keys_with_fallback() -> list[str]:
     return list(_EMBEDDED_API_KEYS)
 
 
-def _load_prompt_template_with_fallback() -> str:
-    if Path(gemini_client.PROMPT_TEMPLATE_PATH).is_file():
+def _load_prompt_template_with_fallback(style: str = gemini_client.DEFAULT_STYLE) -> str:
+    """各スタイルの外部テンプレートファイルが存在すればそちらを使い、
+    無ければ埋め込み済みの初期値(_EMBEDDED_PROMPT_TEMPLATES)にフォールバックする。
+    gemini_client._load_prompt_template(style) と同じシグネチャ。
+    """
+    path = Path(gemini_client.PROMPT_TEMPLATE_PATHS.get(style, gemini_client.PROMPT_TEMPLATE_PATH))
+    if path.is_file():
         try:
-            return _original_load_prompt_template()
+            return _original_load_prompt_template(style)
         except gemini_client.GeminiError:
-            pass
-    return _EMBEDDED_PROMPT_TEMPLATE
+            pass  # ファイルはあるが読み込みエラー → 埋め込み済みの初期値にフォールバック
+    return _EMBEDDED_PROMPT_TEMPLATES.get(style, _EMBEDDED_PROMPT_TEMPLATE)
 
 
 gemini_client._load_api_keys = _load_api_keys_with_fallback
@@ -210,6 +325,26 @@ def _load_signature() -> str:
         except OSError:
             pass
     return _EMBEDDED_SIGNATURE.strip()
+
+
+def _seed_master_dictionary_if_missing() -> None:
+    """exeと同じフォルダにpii_dictionary.csvがまだ無ければ(配布直後の初回起動)、
+    埋め込み済みの辞書を種として書き出す。以後はそのファイルがそのまま使われ、
+    load_master_dictionary/append_to_master_dictionary(pii_core.py)により
+    通常通り追記・蓄積されていく(cp932で統一、DICTIONARY_ENCODING参照)。
+    """
+    if MASTER_DICTIONARY_PATH.exists():
+        return
+    try:
+        MASTER_DICTIONARY_PATH.write_text(_EMBEDDED_DICTIONARY_CSV, encoding="cp932", newline="")
+    except OSError:
+        pass  # 書き出しに失敗しても、辞書無しの状態から始まるだけなので致命的ではない
+
+
+_seed_master_dictionary_if_missing()
+# 過去バージョンで作られた旧形式(「元の値,匿名化後,種別」の3列)のファイルが
+# 残っていれば、追記時に列がずれないよう新形式(2列)に書き換えておく。
+migrate_dictionary_file_if_needed(MASTER_DICTIONARY_PATH)
 
 
 class PiiAnonymizerApp(ctk.CTk):
@@ -287,16 +422,18 @@ class PiiAnonymizerApp(ctk.CTk):
         self.llm_progress_label = ctk.CTkLabel(bar, text="", text_color="gray")
         self.llm_progress_label.pack(side="left", padx=(12, 0))
 
-        # 右上: 非エンジニアでも署名・Geminiへのプロンプト・APIキーを自分で
+        # 右上: 非エンジニアでも辞書・署名・Geminiへのプロンプト・APIキーを自分で
         # 編集できるようにするボタン群(_open_edit_window参照)。pack(side="right")は
-        # 先に置いたものほど右端に来るため、見た目の並びを「署名/プロンプト/APIキー」に
-        # するには逆順(APIキー→プロンプト→署名)でpackする。
+        # 先に置いたものほど右端に来るため、見た目の並びを「辞書/署名/プロンプト/APIキー」に
+        # するには逆順(APIキー→プロンプト→署名→辞書)でpackする。
         ctk.CTkButton(bar, text="APIキー", width=90,
                       command=self.on_edit_api_key).pack(side="right", padx=(4, 8))
         ctk.CTkButton(bar, text="Geminiへのプロンプト", width=150,
                       command=self.on_edit_prompt_template).pack(side="right", padx=4)
         ctk.CTkButton(bar, text="署名", width=90,
                       command=self.on_edit_signature).pack(side="right", padx=4)
+        ctk.CTkButton(bar, text="辞書", width=90,
+                      command=self.on_edit_dictionary).pack(side="right", padx=4)
 
     def _build_main_area(self):
         self.tabview = ctk.CTkTabview(self, command=self._on_tab_changed)
@@ -503,10 +640,12 @@ class PiiAnonymizerApp(ctk.CTk):
         left.grid(row=1, column=0, sticky="nsew", padx=(0, 4))
         ctk.CTkLabel(left, text="匿名化解除後プレビュー", font=ctk.CTkFont(weight="bold")
                      ).pack(anchor="w", padx=8, pady=(8, 2))
+        # プレビューだが編集可能にしておき(自動反映後、送信前に文面を微調整できる
+        # ように)、「返信メール作成」(on_create_reply_mail)はこの欄の現在の中身を
+        # そのままOutlookの返信本文に使う。
         self.deanon_preview_box = ctk.CTkTextbox(left, wrap="word", undo=True, autoseparators=True, maxundo=-1)
         self.deanon_preview_box.pack(fill="both", expand=True, padx=8, pady=(0, 4))
         self._setup_undo_redo(self.deanon_preview_box)
-        self.deanon_preview_box.configure(state="disabled")
 
         deanon_btn_row = ctk.CTkFrame(left, fg_color="transparent")
         deanon_btn_row.pack(fill="x", padx=8, pady=(0, 8))
@@ -552,7 +691,20 @@ class PiiAnonymizerApp(ctk.CTk):
         ctk.CTkLabel(right, text="AIによる返信案(匿名化)", font=ctk.CTkFont(weight="bold")
                      ).pack(anchor="w", padx=8, pady=(8, 2))
         self.deanon_input_box = ctk.CTkTextbox(right, wrap="word")
-        self.deanon_input_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.deanon_input_box.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+
+        # AIが選んだプロンプト方針(short / standard / long_search)と判断理由を表示する。
+        # _on_generate_reply_done が生成完了後に _update_deanon_style_label() を呼んで更新する。
+        ctk.CTkLabel(right, text="使用したプロンプト方針",
+                     font=ctk.CTkFont(weight="bold")
+                     ).pack(anchor="w", padx=8, pady=(0, 2))
+        self.deanon_style_label = ctk.CTkLabel(
+            right,
+            text="(まだAIによる返答生成は実行されていません)",
+            anchor="w", justify="left", wraplength=360,
+            text_color="gray",
+        )
+        self.deanon_style_label.pack(fill="x", padx=8, pady=(0, 8))
 
         # AIによる返答生成時、Google検索によるグラウンディングで実際に参照した
         # Webページ(根拠)があれば表示する。手動で貼り付けたテキストの匿名化解除
@@ -963,8 +1115,14 @@ class PiiAnonymizerApp(ctk.CTk):
 
     def on_generate_reply(self):
         """「🤖 AIによる返答生成」: 匿名化後プレビューの文章 + 「どういう返信をしたいか」欄の
-        内容 + プロンプトテンプレート(reply_prompt_template.txt)を組み立て、Geminiに
-        送信して返信文の案を生成する。外部に送るのはあくまで匿名化後の文章のみ。
+        内容を Gemini に送信し、返信文の案を生成する。外部に送るのはあくまで匿名化後の文章のみ。
+
+        AIエージェント動作(2段階):
+          1. decide_reply_style() で、匿名化後の文章・返信方針をもとに
+             short / standard / long_search の3種類のプロンプトのうちどれを使うべきか
+             Gemini に判断させる(ツール無しの軽量呼び出し1回)。
+          2. その判断結果のスタイルで generate_reply() を呼び、実際の返信文を生成する
+             (Google検索によるグラウンディングを使用)。
         """
         anonymized_text = self.preview_box.get("1.0", "end-1c")
         if not anonymized_text.strip():
@@ -982,11 +1140,12 @@ class PiiAnonymizerApp(ctk.CTk):
 
         self._gemini_busy = True
         self.btn_generate_reply.configure(state="disabled")
-        self.set_status("Gemini APIに問い合わせ中...")
+        self.set_status("Gemini APIに問い合わせ中(プロンプト方針を判断中)...")
 
         def worker():
             try:
-                result = gemini_client.generate_reply(anonymized_text, reply_intent)
+                # エージェント版: (1)スタイル判断 → (2)返信生成の2段階を内部で実行する
+                result = gemini_client.generate_reply_with_agent(anonymized_text, reply_intent)
                 error = None
             except gemini_client.GeminiError as e:
                 result, error = None, str(e)
@@ -1013,6 +1172,18 @@ class PiiAnonymizerApp(ctk.CTk):
         self.deanon_input_box.delete("1.0", "end")
         self.deanon_input_box.insert("1.0", result.text)
         self._update_deanon_sources(result.sources, result.search_queries)
+        self._update_deanon_style_label(result.style, result.style_reason, model=result.model)
+
+        # AIが選んだスタイルと判断理由、使用モデルをステータスバーにも表示する
+        style_label = gemini_client.STYLE_LABELS.get(result.style, result.style)
+        reason = result.style_reason or "(理由不明)"
+        model_name = result.model or ""
+        provider_name = "Groq" if "gpt-oss" in model_name else "Gemini"
+        model_info = f" [{provider_name}: {model_name}]" if model_name else ""
+        self.set_status(
+            f"AIによる返答生成完了{model_info}。プロンプト方針:「{style_label}」({reason})"
+        )
+
         self.on_deanonymize()
 
     def _set_deanon_sources_text(self, text: str):
@@ -1040,6 +1211,18 @@ class PiiAnonymizerApp(ctk.CTk):
             lines.append(f"{i}. {s.title}\n   {s.uri}")
         self._set_deanon_sources_text("\n".join(lines))
 
+    def _update_deanon_style_label(self, style: str, reason: str, model: str = "") -> None:
+        """②タブの「使用したプロンプト方針」ラベルを更新する。
+        style は gemini_client.STYLE_LABELS のキー、reason は判断理由の文字列。
+        """
+        style_label = gemini_client.STYLE_LABELS.get(style, style)
+        reason_text = reason.strip() if reason and reason.strip() else "(理由不明)"
+        model_tag = f" [{model}]" if model else ""
+        self.deanon_style_label.configure(
+            text=f"【{style_label}】{model_tag}  {reason_text}",
+            text_color=("black", "white"),  # (ライトモード, ダークモード)
+        )
+
     def _refresh_deanon_ref_sheet(self):
         rows = self._pull_rows_from_sheet()
         data = [[r["original"], r["replacement"], r["type"]] for r in rows]
@@ -1047,8 +1230,14 @@ class PiiAnonymizerApp(ctk.CTk):
         self.deanon_ref_sheet.set_all_column_widths()
 
     def on_deanonymize(self) -> bool:
-        """戻り値: 匿名化解除後プレビューを実際に更新できたかどうか
-        (on_create_reply_mailが、この後に引用を追記してよいか判断するのに使う)。
+        """「AIによる返信案(匿名化)」欄(deanon_input_box)の内容を、対応表を使って
+        匿名化解除し、「匿名化解除後プレビュー」欄に反映する。AIによる返答生成の
+        完了時(_on_generate_reply_done)と、「← 匿名化解除してプレビューに反映」
+        ボタン(手動貼り付け用)の2箇所から呼ばれる。
+        on_create_reply_mailはここを経由せず、プレビュー欄のその時点の中身
+        (手動編集も含む)をそのまま使う(呼ぶと手動編集を上書きしてしまうため)。
+
+        戻り値: 匿名化解除後プレビューを実際に更新できたかどうか。
         """
         self._refresh_deanon_ref_sheet()
         encoded_text = self.deanon_input_box.get("1.0", "end-1c")
@@ -1077,10 +1266,8 @@ class PiiAnonymizerApp(ctk.CTk):
         if signature:
             result = f"{result}\n\n{signature}"
 
-        self.deanon_preview_box.configure(state="normal")
         self.deanon_preview_box.delete("1.0", "end")
         self.deanon_preview_box.insert("1.0", result)
-        self.deanon_preview_box.configure(state="disabled")
 
         # 入力中に見つからなかったタグ(対応表に無い/既に手動編集された等)を検知して警告
         unresolved = [tag for tag in rev_mapping if tag not in encoded_text]
@@ -1094,16 +1281,16 @@ class PiiAnonymizerApp(ctk.CTk):
         return True
 
     def on_create_reply_mail(self):
-        """「返信メール作成」: 匿名化解除後プレビューを最新の対応表・返信案で作り直した
-        うえで、Outlook標準の「返信」(引用を自動生成)を使い、その本文の先頭に
-        この返信案を差し込んだ状態でOutlookの作成画面を開く。
+        """「返信メール作成」: 「匿名化解除後プレビュー」欄の現在の中身(手動編集も
+        含む)をそのまま使い、Outlook標準の「返信」(引用を自動生成)で、その本文の
+        先頭に差し込んだ状態でOutlookの作成画面を開く。
+        ここでプレビューの再生成(on_deanonymize)は行わない。行うと直前の手動編集が
+        上書きされてしまうため、プレビューへの反映はAIによる返答生成時の自動反映、
+        または「← 匿名化解除してプレビューに反映」ボタンでのみ行う。
         「メール取得」でOutlookから取得したメールに対してのみ実行できる
         (元のメールをOutlook側で再度特定する必要があるため)。
         送信は行わない。内容の確認・編集・送信はOutlook上でユーザー自身が行う。
         """
-        if not self.on_deanonymize():
-            return
-
         mail = self._fetched_mail
         if not mail or not mail.get("entry_id"):
             messagebox.showinfo(
@@ -1113,11 +1300,17 @@ class PiiAnonymizerApp(ctk.CTk):
             )
             return
 
+        reply_body = self.deanon_preview_box.get("1.0", "end-1c")
+        if not reply_body.strip():
+            messagebox.showinfo(
+                "確認",
+                "匿名化解除後プレビューが空です。①タブで「🤖 AIによる返答生成」を実行してください。",
+            )
+            return
+
         if self._outlook_busy:
             messagebox.showinfo("確認", "既にOutlookで返信メールを作成中です。完了するまでお待ちください。")
             return
-
-        reply_body = self.deanon_preview_box.get("1.0", "end-1c")
 
         self._outlook_busy = True
         self.btn_create_reply_mail.configure(state="disabled")
@@ -1161,11 +1354,13 @@ class PiiAnonymizerApp(ctk.CTk):
 
         self.deanon_input_box.delete("1.0", "end")
 
-        self.deanon_preview_box.configure(state="normal")
         self.deanon_preview_box.delete("1.0", "end")
-        self.deanon_preview_box.configure(state="disabled")
 
         self._set_deanon_sources_text("(まだAIによる返答生成は実行されていません)")
+        self.deanon_style_label.configure(
+            text="(まだAIによる返答生成は実行されていません)",
+            text_color="gray",
+        )
 
         self._fetched_mail = None
         self.tabview.set("① 匿名化")
@@ -1187,13 +1382,21 @@ class PiiAnonymizerApp(ctk.CTk):
             self.set_status(f"モデル準備エラー: {msg}")
             messagebox.showwarning("モデル準備エラー", msg)
 
+        def handle_progress(percent):
+            self.set_status(
+                f"モデルをHuggingFaceからダウンロード中... ({filename}、{percent}%)"
+            )
+
         def on_done():
             self.after(0, handle_done)
 
         def on_error(msg):
             self.after(0, lambda: handle_error(msg))
 
-        local_llm.preload_model_async(repo_id, filename, on_done, on_error)
+        def on_progress(percent):
+            self.after(0, lambda: handle_progress(percent))
+
+        local_llm.preload_model_async(repo_id, filename, on_done, on_error, on_progress=on_progress)
 
     # ------------------------------------------------------------------
     # 署名・Geminiへのプロンプト・APIキーの編集(非エンジニアがexeやコードを直接
@@ -1242,21 +1445,146 @@ class PiiAnonymizerApp(ctk.CTk):
 
         self._open_edit_window("署名の編集(返信メール末尾に自動で付きます)", current, save)
 
-    def on_edit_prompt_template(self):
-        path = Path(gemini_client.PROMPT_TEMPLATE_PATH)
-        current = path.read_text(encoding="utf-8") if path.is_file() else _EMBEDDED_PROMPT_TEMPLATE
+    def on_edit_dictionary(self):
+        """マスター辞書(pii_dictionary.csv)を表計算(tksheet)形式で表示・編集する。
+        対応表ペインのsheet(_refresh_sheet_from_rows等)と同じ考え方で、行の
+        追加・削除・並べ替え・セル書き換えができる。「保存」を押すと、その時点の
+        シート全体でpii_dictionary.csvを上書きする(pii_core.save_master_dictionary
+        参照。追記専用のappend_to_master_dictionaryとは別処理)。
+        """
+        if MASTER_DICTIONARY_PATH.is_file():
+            entries = load_master_dictionary(MASTER_DICTIONARY_PATH)
+        else:
+            entries = parse_dictionary_csv_text(_EMBEDDED_DICTIONARY_CSV)
+        data = [[original, info.get("type", "")] for original, info in entries.items()]
 
-        def save(text: str):
-            try:
-                path.write_text(text, encoding="utf-8")
-                self.set_status("Geminiへのプロンプトを保存しました。")
-            except OSError as e:
-                messagebox.showwarning("保存エラー", f"プロンプトの保存に失敗しました: {e}")
+        win = ctk.CTkToplevel(self)
+        win.title("マスター辞書の編集")
+        win.geometry("640x600")
+        win.transient(self)
 
-        self._open_edit_window(
-            "Geminiへのプロンプトの編集({reply_intent}/{anonymized_text}は書き換えないこと)",
-            current, save,
+        ctk.CTkLabel(win, text="マスター辞書の編集(元の値・種別)",
+                     font=ctk.CTkFont(weight="bold")
+                     ).pack(anchor="w", padx=10, pady=(10, 4))
+
+        sheet_frame = ctk.CTkFrame(win, fg_color="transparent")
+        sheet_frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+        dict_sheet = Sheet(
+            sheet_frame,
+            headers=["元の値", "種別"],
+            data=data,
         )
+        dict_sheet.enable_bindings(
+            "single_select", "row_select", "column_select",
+            "arrowkeys", "edit_cell", "delete_key", "copy", "paste",
+            "right_click_popup_menu", "rc_insert_row", "rc_delete_row",
+        )
+        dict_sheet.pack(fill="both", expand=True)
+
+        row_btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        row_btn_row.pack(fill="x", padx=10, pady=(0, 4))
+        ctk.CTkButton(row_btn_row, text="行追加", width=1,
+                      command=lambda: dict_sheet.insert_row(["", ""])
+                      ).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(row_btn_row, text="選択行を削除", fg_color="#a33", hover_color="#822", width=1,
+                      command=lambda: dict_sheet.delete_rows(dict_sheet.get_selected_rows())
+                      ).pack(side="left")
+
+        def handle_save():
+            pairs = [
+                (r[0] if len(r) > 0 else "", r[1] if len(r) > 1 else "")
+                for r in dict_sheet.get_sheet_data()
+            ]
+            try:
+                skipped = save_master_dictionary(pairs, MASTER_DICTIONARY_PATH)
+            except OSError as e:
+                messagebox.showwarning("保存エラー", f"マスター辞書の保存に失敗しました: {e}")
+                return
+            status = "マスター辞書を保存しました。"
+            if skipped:
+                status += f" (文字コードの都合で{len(skipped)}件は保存できませんでした。)"
+            self.set_status(status)
+            win.destroy()
+
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkButton(btn_row, text="保存", command=handle_save).pack(side="right")
+        ctk.CTkButton(btn_row, text="キャンセル", fg_color="gray40", hover_color="gray30",
+                      command=win.destroy).pack(side="right", padx=(0, 8))
+
+        win.grab_set()
+
+    def on_edit_prompt_template(self):
+        """「Geminiへのプロンプト」ボタン: 3種類のプロンプトをタブで並べて編集できるウィンドウを開く。
+        各タブは short / standard / long_search に対応し、それぞれの外部ファイルに保存する。
+        外部ファイルが無い場合は埋め込み済みの初期値を表示する。
+        「すべて保存」で3ファイルをまとめて書き出す。
+        """
+        # スタイルごとの表示ラベル・外部ファイルパス・初期値を準備する
+        style_info: list[tuple[str, str, Path, str]] = []  # (style_key, label, path, initial_text)
+        for style, label in gemini_client.STYLE_LABELS.items():
+            fpath = Path(gemini_client.PROMPT_TEMPLATE_PATHS[style])
+            if fpath.is_file():
+                try:
+                    initial = fpath.read_text(encoding="utf-8")
+                except OSError:
+                    initial = _EMBEDDED_PROMPT_TEMPLATES.get(style, _EMBEDDED_PROMPT_TEMPLATE)
+            else:
+                initial = _EMBEDDED_PROMPT_TEMPLATES.get(style, _EMBEDDED_PROMPT_TEMPLATE)
+            style_info.append((style, label, fpath, initial))
+
+        win = ctk.CTkToplevel(self)
+        win.title("Geminiへのプロンプトの編集(3種類)")
+        win.geometry("1100x620")
+        win.transient(self)
+
+        ctk.CTkLabel(
+            win,
+            text="{reply_intent} / {anonymized_text} のプレースホルダーは書き換えないこと。"
+                 "「すべて保存」で3種類をまとめて保存します。",
+            anchor="w",
+        ).pack(anchor="w", padx=12, pady=(10, 4))
+
+        # 3種類のプロンプトをタブで横並び表示
+        tabview = ctk.CTkTabview(win)
+        tabview.pack(fill="both", expand=True, padx=12, pady=(0, 4))
+
+        boxes: dict[str, ctk.CTkTextbox] = {}
+        for style_key, label, _fpath, initial in style_info:
+            tab_label = f"{label}  ({style_key})"
+            tab = tabview.add(tab_label)
+            tab.grid_rowconfigure(0, weight=1)
+            tab.grid_columnconfigure(0, weight=1)
+            box = ctk.CTkTextbox(tab, wrap="word")
+            box.grid(row=0, column=0, sticky="nsew")
+            box.insert("1.0", initial)
+            boxes[style_key] = box
+
+        def handle_save():
+            errors: list[str] = []
+            saved: list[str] = []
+            for style_key, label, fpath, _initial in style_info:
+                text = boxes[style_key].get("1.0", "end-1c")
+                try:
+                    fpath.write_text(text, encoding="utf-8")
+                    saved.append(label)
+                except OSError as e:
+                    errors.append(f"{label}: {e}")
+            if errors:
+                messagebox.showwarning("保存エラー", "一部のファイルの保存に失敗しました:\n" + "\n".join(errors))
+            if saved:
+                self.set_status(f"Geminiへのプロンプトを保存しました({' / '.join(saved)})。")
+            win.destroy()
+
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(fill="x", padx=12, pady=(0, 10))
+        ctk.CTkButton(btn_row, text="すべて保存", command=handle_save).pack(side="right")
+        ctk.CTkButton(
+            btn_row, text="キャンセル", fg_color="gray40", hover_color="gray30",
+            command=win.destroy,
+        ).pack(side="right", padx=(0, 8))
+
+        win.grab_set()
 
     def on_edit_api_key(self):
         path = Path(gemini_client.API_KEY_PATH)
@@ -1265,12 +1593,12 @@ class PiiAnonymizerApp(ctk.CTk):
         def save(text: str):
             try:
                 path.write_text(text, encoding="utf-8")
-                self.set_status("Gemini APIキーを保存しました。")
+                self.set_status("APIキーを保存しました。")
             except OSError as e:
                 messagebox.showwarning("保存エラー", f"APIキーの保存に失敗しました: {e}")
 
         self._open_edit_window(
-            "Gemini APIキーの編集(1行に1つ。複数書くとレート制限時に自動で切り替わります)",
+            "APIキーの編集(1行に1つ。gskで始まるキーはGroq(GPT-OSS 20B)、その他はGeminiを使用。複数書くとレート制限時に自動切替)",
             current, save,
         )
 

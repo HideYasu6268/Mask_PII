@@ -195,11 +195,20 @@ def _load_model(repo_id: str, filename: str, on_progress=None):
         model_path = _ensure_model_file(repo_id, filename, on_progress=on_progress)
 
         try:
-            n_threads = os.cpu_count() or 4
+            # n_threads: デコード(1トークンずつの生成)はHT(論理コア)の恩恵がほぼ無く、
+            # 物理コア数を超えると逆にオーバーヘッドになるため、論理コア数の半分
+            # (物理コア数の近似値)に絞る。例: i7-1165G7(4C8T)なら4。
+            # n_threads_batch: プロンプトの一括処理(バッチ処理)は並列度が効きやすいため、
+            # 論理コア数をそのまま使う。
+            logical_cpus = os.cpu_count() or 8
+            n_threads = max(1, logical_cpus // 2)
+            n_threads_batch = logical_cpus
             llm = Llama(
                 model_path=model_path,
                 n_ctx=4096,
                 n_threads=n_threads,
+                n_threads_batch=n_threads_batch,
+                n_batch=1024,
                 verbose=False,
             )
         except Exception as e:  # noqa: BLE001

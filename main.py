@@ -797,8 +797,13 @@ class PiiAnonymizerApp(ctk.CTk):
 
     def on_generate_reply(self):
         """「🤖 AIによる返答生成」: 匿名化後プレビューの文章 + 「どういう返信をしたいか」欄の
-        内容 + プロンプトテンプレート(reply_prompt_template.txt)を組み立て、Geminiに
-        送信して返信文の案を生成する。外部に送るのはあくまで匿名化後の文章のみ。
+        内容を使い、AIエージェントとして2段階で返信文を生成する。
+
+        1. まず gemini_client.decide_reply_style() が、3種類の返信プロンプト
+           (短め/通常/検索+丁寧)のうちどれを使うべきかをGeminiに判断させる。
+        2. その判断結果で gemini_client.generate_reply() が実際の返信文を生成する。
+
+        外部に送るのはあくまで匿名化後の文章のみ(判断・生成のどちらのステップも)。
         """
         anonymized_text = self.preview_box.get("1.0", "end-1c")
         if not anonymized_text.strip():
@@ -816,11 +821,11 @@ class PiiAnonymizerApp(ctk.CTk):
 
         self._gemini_busy = True
         self.btn_generate_reply.configure(state="disabled")
-        self.set_status("Gemini APIに問い合わせ中...")
+        self.set_status("① 返信方針を判断中(Gemini)...")
 
         def worker():
             try:
-                result = gemini_client.generate_reply(anonymized_text, reply_intent)
+                result = gemini_client.generate_reply_with_agent(anonymized_text, reply_intent)
                 error = None
             except gemini_client.GeminiError as e:
                 result, error = None, str(e)
@@ -839,6 +844,11 @@ class PiiAnonymizerApp(ctk.CTk):
             messagebox.showwarning("AIによる返答生成エラー", error)
             return
 
+        style_label = gemini_client.STYLE_LABELS.get(result.style, result.style)
+        self.set_status(
+            f"② 返信方針「{style_label}」で生成しました({result.style_reason})"
+        )
+
         # 生成結果(タグ付きのまま)を②タブの「AIによる返信案(匿名化)」欄に自動反映し、
         # そのまま匿名化解除まで自動実行する(ユーザーがボタンを押す手間を省く)。
         # on_deanonymize側が解除結果の詳細なステータスを表示するので、ここでは
@@ -846,7 +856,9 @@ class PiiAnonymizerApp(ctk.CTk):
         self.tabview.set("② 匿名化解除")
         self.deanon_input_box.delete("1.0", "end")
         self.deanon_input_box.insert("1.0", result.text)
-        self._update_deanon_sources(result.sources, result.search_queries)
+        self._update_deanon_sources(
+            result.sources, result.search_queries, result.style, result.style_reason
+        )
         self.on_deanonymize()
 
     def _set_deanon_sources_text(self, text: str):
@@ -855,17 +867,32 @@ class PiiAnonymizerApp(ctk.CTk):
         self.deanon_sources_box.insert("1.0", text)
         self.deanon_sources_box.configure(state="disabled")
 
-    def _update_deanon_sources(self, sources: list, search_queries: list[str]):
-        """AIによる返答生成の結果、Google検索によるグラウンディングで実際に参照した
-        Webページ(根拠)があれば一覧表示する。検索が行われなかった場合はその旨を表示する。
+    def _update_deanon_sources(
+        self,
+        sources: list,
+        search_queries: list[str],
+        style: str = "",
+        style_reason: str = "",
+    ):
+        """AIによる返答生成の結果を表示する。
+        - style/style_reason: エージェントが判断した返信方針(短め/通常/検索+丁寧)と
+          その理由。指定が無い場合(旧経路からの呼び出し等)は表示しない。
+        - sources/search_queries: Google検索によるグラウンディングで実際に参照した
+          Webページ(根拠)。検索が行われなかった場合はその旨を表示する。
         """
+        lines: list[str] = []
+        if style:
+            style_label = gemini_client.STYLE_LABELS.get(style, style)
+            lines.append(f"判断された返信方針: {style_label}")
+            if style_reason:
+                lines.append(f"判断理由: {style_reason}")
+            lines.append("")
+
         if not sources:
-            self._set_deanon_sources_text(
-                "(この返信案の作成にあたり、Web検索による根拠確認は行われませんでした)"
-            )
+            lines.append("(この返信案の作成にあたり、Web検索による根拠確認は行われませんでした)")
+            self._set_deanon_sources_text("\n".join(lines))
             return
 
-        lines = []
         if search_queries:
             lines.append("検索クエリ: " + " / ".join(search_queries))
             lines.append("")
@@ -1082,18 +1109,47 @@ class PiiAnonymizerApp(ctk.CTk):
         self._open_edit_window("署名の編集(返信メール末尾に自動で付きます)", current, save)
 
     def on_edit_prompt_template(self):
-        path = Path(gemini_client.PROMPT_TEMPLATE_PATH)
+        """返信プロンプトは short/standard/long_search の3種類あるため、まずどれを
+        編集するかを選ぶ小さなウィンドウを出し、選択後に既存の _open_edit_window を開く。
+        """
+        chooser = ctk.CTkToplevel(self)
+        chooser.title("編集するプロンプトを選択")
+        chooser.geometry("380x200")
+        chooser.transient(self)
+
+        ctk.CTkLabel(
+            chooser,
+            text="AIエージェントが判断して使い分ける3種類のプロンプトのうち、\nどれを編集しますか?",
+            justify="left",
+        ).pack(padx=16, pady=(16, 8), anchor="w")
+
+        def choose(style: str):
+            chooser.destroy()
+            self._edit_prompt_template_for_style(style)
+
+        for style, label in gemini_client.STYLE_LABELS.items():
+            ctk.CTkButton(
+                chooser, text=label, width=300,
+                command=lambda s=style: choose(s),
+            ).pack(padx=16, pady=4)
+
+        chooser.grab_set()
+
+    def _edit_prompt_template_for_style(self, style: str):
+        path = Path(gemini_client.PROMPT_TEMPLATE_PATHS[style])
         current = path.read_text(encoding="utf-8") if path.is_file() else ""
+        style_label = gemini_client.STYLE_LABELS.get(style, style)
 
         def save(text: str):
             try:
                 path.write_text(text, encoding="utf-8")
-                self.set_status("Geminiへのプロンプトを保存しました。")
+                self.set_status(f"Geminiへのプロンプト(「{style_label}」用)を保存しました。")
             except OSError as e:
                 messagebox.showwarning("保存エラー", f"プロンプトの保存に失敗しました: {e}")
 
         self._open_edit_window(
-            "Geminiへのプロンプトの編集({reply_intent}/{anonymized_text}は書き換えないこと)",
+            f"Geminiへのプロンプトの編集(「{style_label}」用。"
+            "{reply_intent}/{anonymized_text}は書き換えないこと)",
             current, save,
         )
 
