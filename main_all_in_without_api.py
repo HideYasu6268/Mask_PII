@@ -1143,12 +1143,19 @@ class PiiAnonymizerApp(ctk.CTk):
 
         self._gemini_busy = True
         self.btn_generate_reply.configure(state="disabled")
-        self.set_status("Gemini APIに問い合わせ中(プロンプト方針を判断中)...")
+        self.set_status("Gemini APIに問い合わせ中...")
+
+        def on_progress(text: str):
+            # gemini_client側(ワーカースレッド)から「どのモデルに何を依頼中か」が届く。
+            # UIの更新はメインスレッドで行う必要があるので after(0, ...) に渡す。
+            self.after(0, lambda t=text: self.set_status(t))
 
         def worker():
             try:
                 # エージェント版: (1)スタイル判断 → (2)返信生成の2段階を内部で実行する
-                result = gemini_client.generate_reply_with_agent(anonymized_text, reply_intent)
+                result = gemini_client.generate_reply_with_agent(
+                    anonymized_text, reply_intent, on_progress=on_progress
+                )
                 error = None
             except gemini_client.GeminiError as e:
                 result, error = None, str(e)

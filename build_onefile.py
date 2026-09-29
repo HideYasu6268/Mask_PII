@@ -23,11 +23,10 @@ FORBIDDEN_ARCHIVE_NAMES = (
     "gemini_api_key.txt",
     "pii_dictionary.csv",
     "main_all_in.py",
-    "reply_prompt_short.txt",
-    "reply_prompt_template.txt",
-    "reply_prompt_long_search.txt",
     "署名.txt",
 )
+# reply_prompt_*.txt は同梱を許可している(プロンプトは公開してよい内容のため)。
+# そのため FORBIDDEN_ARCHIVE_NAMES には含めない。
 
 
 def _blob_from_extract(extracted) -> bytes:

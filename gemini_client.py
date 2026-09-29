@@ -10,10 +10,16 @@ Google Gemini APIとの通信を行う(このアプリで唯一、外部にネ�
   次の行のキーに自動で切り替えて再試行する(全キーが429の場合のみエラーになる)。
   このファイルは.gitignore対象で、リポジトリには仮の値しか入っていない。
   実際に使う際は自分のAPIキーに書き換えること。
-  各キーはアカウントごとに使えるモデルが異なるため、キーの接頭辞から
-  推奨モデルを自動選択する(_preferred_model_for_key参照。AIzaSy...形式→
-  DEFAULT_MODEL、AQ.形式→FALLBACK_MODEL)。推奨モデルが404(NOT_FOUND)の
-  場合は、そのキーのままもう一方のモデルで再試行する。
+- 使用するGeminiモデルは、キーごとに models.list() で「実際に使えるflash系モデル」を
+  取得し、バージョンが新しいものから順に試す(get_flash_models参照)。
+  アカウントごとに使えるモデルが異なるため、以前のような接頭辞(AIzaSy.../AQ.)による
+  推奨モデルの決め打ちは廃止した。一覧の取得に失敗した場合のみ、固定の
+  DEFAULT_MODEL → FALLBACK_MODEL にフォールバックする。
+  ・404(モデルが使えない)/ 503等のサーバー側エラー: 次に新しいモデルで再試行
+  ・429(レート制限): 既定では同じキーで古いモデルを先に試し(TRY_OLDER_MODEL_ON_429=True)、
+    それも駄目なら次のAPIキーへ(Falseなら429で即・次のキーへ)
+- 判断ステップ(decide_reply_style)はflash-lite系(get_lite_models)を新しい順に試し、
+  生成ステップ(generate_reply)はflash系(get_flash_models)を使う。クォータを分けるため。
 - プロンプトテンプレートは同じディレクトリの3ファイルから読み込む(PROMPT_STYLES参照)。
   テンプレート中の {reply_intent} / {anonymized_text} が、それぞれアプリ上の
   「どういう返信をしたいか」欄の内容・匿名化後の文章に置き換わる。
@@ -37,13 +43,17 @@ Google Gemini APIとの通信を行う(このアプリで唯一、外部にネ�
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from typing import Callable
 
 # PyInstallerでexe化した場合、__file__はexeの実体とは別の展開先(onefileなら
 # 起動のたびに消える一時フォルダ)を指してしまうため、frozen時はexe自身の
@@ -79,19 +89,102 @@ STYLE_LABELS: dict[str, str] = {
     "long_search": "検索+丁寧(長め)",
 }
 
+# ---------------------------------------------------------------------------
+# モデル選択の設定
+# ---------------------------------------------------------------------------
+# models.list() でモデル一覧を取得できなかった場合(通信エラー・権限不足など)に
+# だけ使う固定のフォールバック。通常は get_flash_models() が返す新しい順の
+# リストが使われる。
 DEFAULT_MODEL = "gemini-3.8-flash"
-
-# DEFAULT_MODELが404(NOT_FOUND、特定アカウントで利用不可などモデル自体が
-# 使えないケース)になった場合に自動で切り替えて再試行するモデル。
 FALLBACK_MODEL = "gemini-3.6-flash"
 
-# 判断ステップ(decide_reply_style)専用の軽量モデル。生成ステップと違い検索が
-# 不要なため、速度重視でflash系固定でよい。
-DECIDE_MODEL = "gemini-3.8-flash"
+# 判断ステップ(decide_reply_style)専用。生成ステップと違い検索が不要な単純な
+# 分類なので、flash-lite系を新しい順に試す(get_lite_models参照)。これにより
+# 生成ステップ用のflash系モデルの無料枠(RPD/RPM)を消費しない。
+# 下は models.list() の取得に失敗した場合だけ使う固定のフォールバック。
+DECIDE_FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+DECIDE_MODEL = DECIDE_FALLBACK_MODELS[0]  # 後方互換用
+
+# long_search(Google検索グラウンディングあり)で試すモデル数の上限。None なら
+# models.list() の全候補を新しい順に試す。アカウント(無料枠など)によっては新しい
+# モデルで検索ツールが使えないことがあるため、MAX_MODELS_TO_TRY の制限は受けない。
+# 429/404は0.2秒程度で返るので、全候補を試しても待ち時間は小さい。
+GROUNDING_MAX_MODELS: int | None = None
+
+# 「そのキー+そのモデル+検索ツール」の組み合わせで失敗した場合、この秒数だけ
+# スキップして、次回以降は通るモデルへ直行する(期限が切れたら再挑戦する)。
+GROUNDING_BLOCK_TTL_SEC = 30 * 60
+
+# preview / exp 系のモデルを候補に含めるか。Falseにすると安定版のみを使う。
+# 同じバージョンなら安定版を preview より先に試す。
+INCLUDE_PREVIEW_MODELS = True
+
+# 1回のAPI呼び出しで、1つのキーにつき最大何個のモデルを新しい順に試すか。
+MAX_MODELS_TO_TRY = 4
+
+# 429(レート制限)は通常モデル単位のクォータなので、同じキーで古いモデルなら
+# 通る場合がある。Trueにすると、429でも次のキーへ行く前に同じキーで古いモデルを
+# 試す(Falseにすると従来通り「429なら次のキーへ」)。
+TRY_OLDER_MODEL_ON_429 = True
+
+# モデル一覧のキャッシュ有効期間(秒)。アプリ起動中は使い回し、返信生成のたびに
+# 一覧取得を行わない。
+MODEL_CACHE_TTL_SEC = 6 * 60 * 60
 
 # gemini_api_key.txt に最初から入っている仮の値。これがそのまま残っている場合は
 # 未設定とみなし、実際にはAPIを呼ばずにエラーを返す。
 _PLACEHOLDER_KEY = "YOUR_API_KEY_HERE"
+
+# デバッグ出力(不要になったら False に)
+DEBUG_LOG = True
+
+
+def _log(msg: str) -> None:
+    if DEBUG_LOG:
+        print(f"[gemini_client {time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
+
+def _notify(on_progress: Callable[[str], None] | None, msg: str) -> None:
+    """GUI等へ進捗メッセージを通知する(コールバック未指定・失敗時は何もしない)。
+    ワーカースレッドから呼ばれる前提なので、UI更新は呼び出し側でメインスレッドに渡すこと。"""
+    if on_progress is None:
+        return
+    try:
+        on_progress(msg)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _key_label(idx: int, total: int) -> str:
+    """複数キーのときだけ「(キー2/3)」のような表示を返す。"""
+    return f"(キー{idx}/{total})" if total > 1 else ""
+
+
+def _key_id(api_key: str) -> str:
+    """ログ用にキーを識別する(末尾4文字のみ。キー全体は出さない)。"""
+    return f"...{api_key[-4:]}"
+
+
+# {(キー識別子, モデル名): 失敗した時刻} 検索ツール付きで使えなかった組み合わせの記憶。
+_grounding_blocked: dict[tuple[str, str], float] = {}
+_grounding_lock = threading.Lock()
+
+
+def _mark_grounding_blocked(api_key: str, model: str) -> None:
+    with _grounding_lock:
+        _grounding_blocked[(_key_id(api_key), model)] = time.time()
+
+
+def _is_grounding_blocked(api_key: str, model: str) -> bool:
+    with _grounding_lock:
+        t = _grounding_blocked.get((_key_id(api_key), model))
+        if t is None:
+            return False
+        if time.time() - t > GROUNDING_BLOCK_TTL_SEC:
+            del _grounding_blocked[(_key_id(api_key), model)]
+            return False
+        return True
+
 
 # 判断ステップ(decide_reply_style)でGeminiに渡すシステムプロンプト。
 # 出力はJSON形式({"style": ..., "reason": ...})に固定する。
@@ -163,17 +256,179 @@ def _call_groq_chat(
         return content or ""
 
 
-def _preferred_model_for_key(api_key: str) -> str:
-    """APIキーの接頭辞から推奨モデルを返す。
-    基本は最新の DEFAULT_MODEL を優先する。
-    """
-    if _is_groq_key(api_key):
-        return GROQ_MODEL
-    return DEFAULT_MODEL
-
-
 class GeminiError(RuntimeError):
     pass
+
+
+# ---------------------------------------------------------------------------
+# 利用可能なflashモデルの取得(新しい順)
+# ---------------------------------------------------------------------------
+# 例: "gemini-2.5-flash" / "gemini-2.5-flash-001" / "gemini-3.0-flash-preview"
+# 先頭が "gemini-<数字>-flash" の形のものだけを対象にする。
+# ("gemini-live-2.5-flash-..." のように数字が先頭に来ないものは自動的に対象外)
+_FLASH_NAME_RE = re.compile(r"^gemini-(?P<ver>\d+(?:\.\d+)*)-flash(?:-(?P<suffix>.+))?$")
+
+# サフィックスにこれらを含むものは、テキスト返信用途ではないので除外する。
+_EXCLUDED_SUFFIX_KEYWORDS = (
+    "lite", "image", "tts", "audio", "live", "embedding",
+    "robotics", "computer-use", "8b", "thinking",
+)
+
+# {キーのハッシュ: (取得時刻, [モデル名, ...新しい順])}
+_model_cache: dict[str, tuple[float, list[str]]] = {}
+_model_cache_lock = threading.Lock()
+
+
+def _static_fallback_models(lite: bool = False) -> list[str]:
+    """モデル一覧を取得できなかった場合に使う固定リスト(重複除去済み)。
+    lite=True なら判断ステップ用のlite系、Falseなら生成ステップ用のflash系。"""
+    result: list[str] = []
+    candidates = DECIDE_FALLBACK_MODELS if lite else (DEFAULT_MODEL, FALLBACK_MODEL)
+    for m in candidates:
+        if m not in result:
+            result.append(m)
+    return result
+
+
+def _parse_model_name(name: str, lite: bool = False) -> tuple[str, tuple[int, ...], int] | None:
+    """モデル名を解析し、(短い名前, バージョンのタプル, 品質ランク) を返す。
+    対象外のモデルなら None。品質ランクは小さいほど安定版寄り:
+      0: 別名(gemini-2.5-flash)  1: 日付/連番固定(gemini-2.0-flash-001)
+      2以上: preview / exp / その他のサフィックス付き
+
+    lite=False: 通常のflash系(gemini-3.8-flash など。lite付きは除外)。
+    lite=True : flash-lite系(gemini-3.5-flash-lite / gemini-3.1-flash-lite-preview など。
+                lite-image / lite-tts のような用途違いは除外)。
+    """
+    short = name.split("/")[-1]  # "models/gemini-..." の接頭辞を外す
+    m = _FLASH_NAME_RE.match(short)
+    if not m:
+        return None
+    suffix = (m.group("suffix") or "").lower()
+    if lite:
+        # "lite" または "lite-xxx" だけを対象にし、"lite" 以降を品質判定に使う
+        if suffix == "lite":
+            tail = ""
+        elif suffix.startswith("lite-"):
+            tail = suffix[len("lite-"):]
+        else:
+            return None
+    else:
+        tail = suffix
+    if any(k in tail for k in _EXCLUDED_SUFFIX_KEYWORDS):
+        return None
+    version = tuple(int(x) for x in m.group("ver").split("."))
+    if not tail:
+        quality = 0
+    elif re.fullmatch(r"\d{3}", tail):
+        quality = 1
+    elif "preview" in tail or "exp" in tail:
+        quality = 2
+    else:
+        quality = 3
+    return short, version, quality
+
+
+def _parse_flash_model(name: str) -> tuple[str, tuple[int, ...], int] | None:
+    """後方互換用。通常のflash系の解析(_parse_model_name参照)。"""
+    return _parse_model_name(name, lite=False)
+
+
+def get_flash_models(
+    api_key: str, client=None, force_refresh: bool = False, all_models: bool = False
+) -> list[str]:
+    """生成ステップ用: そのキーで使える通常のflash系モデルを新しい順で返す(_get_models参照)。
+    all_models=True なら MAX_MODELS_TO_TRY で切らず、全候補を返す。"""
+    return _get_models(api_key, client, force_refresh, lite=False, all_models=all_models)
+
+
+def get_lite_models(api_key: str, client=None, force_refresh: bool = False) -> list[str]:
+    """判断ステップ用: そのキーで使えるflash-lite系モデルを新しい順で返す(_get_models参照)。"""
+    return _get_models(api_key, client, force_refresh, lite=True)
+
+
+def _get_models(
+    api_key: str,
+    client=None,
+    force_refresh: bool = False,
+    lite: bool = False,
+    all_models: bool = False,
+) -> list[str]:
+    """そのAPIキーで実際に使えるflash系(lite=Trueならflash-lite系)モデルを、
+    新しい順のリストで返す。
+
+    - models.list() の結果から generateContent 対応のものだけを取り出し、
+      lite / image / tts / live 等の用途違いは除外する。
+    - バージョン(2.5 < 3.0 < 3.8 ...)が新しい順。同じバージョンでは安定版を
+      preview より先にする。同じバージョン・同じ種別(安定/preview)で複数ある場合は
+      最も安定寄りの1つだけ残す(例: gemini-2.5-flash と gemini-2.5-flash-001 は前者のみ)。
+    - 既定では最大 MAX_MODELS_TO_TRY 個まで(all_models=True なら全候補)。
+      全候補のリストを MODEL_CACHE_TTL_SEC 秒キャッシュする。
+    - 一覧の取得に失敗、または該当が0件の場合は固定の DEFAULT_MODEL → FALLBACK_MODEL
+      を返す(この場合はキャッシュしない=次回また取得を試みる)。
+    """
+    label = "lite" if lite else "flash"
+    cache_id = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16] + f":{label}"
+    now = time.time()
+    if not force_refresh:
+        with _model_cache_lock:
+            cached = _model_cache.get(cache_id)
+        if cached and now - cached[0] < MODEL_CACHE_TTL_SEC:
+            _log(f"key {_key_id(api_key)}: {label}モデル一覧はキャッシュ利用 -> {cached[1]}")
+            return list(cached[1] if all_models else cached[1][:MAX_MODELS_TO_TRY])
+
+    try:
+        if client is None:
+            from google import genai
+
+            client = genai.Client(api_key=api_key)
+
+        # (バージョン, previewか) ごとに、最も安定寄りの1つを残す
+        best: dict[tuple[tuple[int, ...], bool], tuple[int, str]] = {}
+        all_names: list[str] = []  # models.list() の生の結果(ログ用)
+        for model_info in client.models.list(config={"page_size": 100}):
+            name = getattr(model_info, "name", None)
+            if not name:
+                continue
+            all_names.append(name)
+            actions = getattr(model_info, "supported_actions", None)
+            if actions is not None and "generateContent" not in actions:
+                continue
+            parsed = _parse_model_name(name, lite)
+            if parsed is None:
+                continue
+            short, version, quality = parsed
+            is_preview = quality >= 2
+            if is_preview and not INCLUDE_PREVIEW_MODELS:
+                continue
+            key = (version, is_preview)
+            current = best.get(key)
+            if current is None or quality < current[0]:
+                best[key] = (quality, short)
+
+        _log(f"key {_key_id(api_key)}: models.list() 全{len(all_names)}件")
+        _log(f"  うちgemini系: {[n for n in all_names if 'gemini' in n]}")
+
+        # バージョン降順、同バージョンでは安定版(is_preview=False)が先
+        ordered = sorted(best.items(), key=lambda kv: (kv[0][0], not kv[0][1]), reverse=True)
+        all_candidates = [value[1] for _, value in ordered]
+        _log(f"  {label}候補(絞り込み後・新しい順): {all_candidates}")
+        candidates = all_candidates
+        _log(f"  試行対象(通常は上位{MAX_MODELS_TO_TRY}件 / 検索ありは全件): {candidates[:MAX_MODELS_TO_TRY]}")
+    except Exception as e:  # noqa: BLE001
+        _log(
+            f"key {_key_id(api_key)}: models.list() 失敗 -> 固定フォールバック "
+            f"{_static_fallback_models(lite)} ({type(e).__name__}: {e})"
+        )
+        return _static_fallback_models(lite)
+
+    if not candidates:
+        _log(f"key {_key_id(api_key)}: {label}該当モデル0件 -> 固定フォールバック {_static_fallback_models(lite)}")
+        return _static_fallback_models(lite)
+
+    with _model_cache_lock:
+        _model_cache[cache_id] = (now, candidates)
+    return list(candidates if all_models else candidates[:MAX_MODELS_TO_TRY])
 
 
 @dataclass
@@ -191,6 +446,7 @@ class GeminiReplyResult:
     # (直接 generate_reply() を呼んだ場合は呼び出し元が指定したstyleがそのまま入る)。
     style: str = DEFAULT_STYLE
     style_reason: str = ""
+    # 実際に返信生成に使われたモデル名(GUI側で表示できる)。
     model: str = ""
 
 
@@ -255,11 +511,18 @@ def _extract_json_object(raw: str) -> dict | None:
         return None
 
 
-def decide_reply_style(anonymized_text: str, reply_intent: str) -> tuple[str, str]:
+def decide_reply_style(
+    anonymized_text: str,
+    reply_intent: str,
+    on_progress: Callable[[str], None] | None = None,
+) -> tuple[str, str]:
     """匿名化後の文章と返信方針から、3種類の返信プロンプト(PROMPT_STYLES)のうち
     どれを使うべきかをLLMに判断させる。
     - gskで始まるキー: Groq API (openai/gpt-oss-20b)
-    - その他のキー: Gemini API (gemini-3.8-flash)
+    - その他のキー: Gemini API(そのキーで使える最新のflash-lite系モデルから順に試す。
+      生成ステップのflash系の無料枠を消費しないため)
+
+    on_progress: 「どのモデルに何を依頼中か」を文字列で受け取るコールバック(省略可)。
 
     戻り値: (style, reason)。style は PROMPT_STYLES のキーのいずれか。
     """
@@ -274,9 +537,10 @@ def decide_reply_style(anonymized_text: str, reply_intent: str) -> tuple[str, st
     )
 
     last_error: Exception | None = None
-    for api_key in api_keys:
+    for key_idx, api_key in enumerate(api_keys, 1):
         content = None
         if _is_groq_key(api_key):
+            _notify(on_progress, f"Groq({GROQ_MODEL}) に返信方針の判断を依頼中... {_key_label(key_idx, len(api_keys))}")
             try:
                 messages = [
                     {"role": "system", "content": DECIDE_STYLE_SYSTEM_PROMPT},
@@ -287,9 +551,11 @@ def decide_reply_style(anonymized_text: str, reply_intent: str) -> tuple[str, st
                 )
             except urllib.error.HTTPError as e:
                 last_error = e
+                _log(f"[decide] Groq HTTPError key {_key_id(api_key)}: {e}")
                 continue
             except Exception as e:  # noqa: BLE001
                 last_error = e
+                _log(f"[decide] Groq Error key {_key_id(api_key)}: {type(e).__name__}: {e}")
                 continue
         else:
             try:
@@ -300,28 +566,34 @@ def decide_reply_style(anonymized_text: str, reply_intent: str) -> tuple[str, st
                 last_error = RuntimeError("google-genaiが未インストールです")
                 continue
 
+            # 最新のflash系は内部で「思考」にトークンを使うことがあり、出力上限が
+            # 小さいと本文が空になるため、JSONが十分収まる範囲で余裕を持たせる。
             config = types.GenerateContentConfig(
                 system_instruction=DECIDE_STYLE_SYSTEM_PROMPT,
                 temperature=0.1,
-                max_output_tokens=200,
+                max_output_tokens=1024,
             )
             client = genai.Client(api_key=api_key)
-            models_to_try = [DECIDE_MODEL] if DECIDE_MODEL == FALLBACK_MODEL else [DECIDE_MODEL, FALLBACK_MODEL]
-            for m in models_to_try:
+            for m in get_lite_models(api_key, client):
+                _log(f"[decide] key {_key_id(api_key)} -> {m} を試行中...")
+                _notify(on_progress, f"{m} に返信方針の判断を依頼中... {_key_label(key_idx, len(api_keys))}")
                 try:
                     resp = client.models.generate_content(
                         model=m, contents=user_content, config=config,
                     )
                     content = getattr(resp, "text", None)
-                    break
+                    _log(f"[decide] OK: {m} (text={'あり' if content else '空'})")
+                    if content:
+                        break
                 except genai_errors.ClientError as e:
                     last_error = e
-                    if e.code == 404:
-                        continue
-                    if e.code == 429:
-                        break
+                    _log(f"[decide] ClientError: {m} code={e.code} {e}")
+                    if e.code == 429 and not TRY_OLDER_MODEL_ON_429:
+                        break  # 次のキーへ
+                    continue  # 429(古いモデルを試す設定)/404/400等は次のモデルへ
                 except Exception as e:  # noqa: BLE001
                     last_error = e
+                    _log(f"[decide] Error: {m} {type(e).__name__}: {e}")
                     continue
 
         if not content:
@@ -347,18 +619,26 @@ def generate_reply(
     anonymized_text: str,
     reply_intent: str,
     style: str = DEFAULT_STYLE,
-    model: str = DEFAULT_MODEL,
+    model: str | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> GeminiReplyResult:
     """匿名化後の文章と返信方針から、指定されたstyle(PROMPT_STYLES参照)の
     プロンプトを組み立て、LLM APIに送信して返信文の案を取得する。
     - gskで始まるキー: Groq API (openai/gpt-oss-20b)
     - その他のキー: Gemini API (Google検索によるグラウンディングを使用)
 
+    model を省略(None)、または DEFAULT_MODEL を渡した場合は、そのキーで使える
+    最新のflash系モデルから順に試す(get_flash_models参照)。それ以外のモデル名を
+    渡した場合は、そのモデルだけを使う(フォールバックなし)。
+
     どのstyleを使うべきかを自動判断させたい場合は、この関数を直接呼ぶのではなく
     generate_reply_with_agent() を使うこと。
 
     gemini_api_key.txtに複数のAPIキーが書かれている場合、上から順に試し、
     レート制限(429)に達したキーは次のキーに自動で切り替えて再試行する。
+
+    on_progress: 「どのモデルに何を依頼中か」を文字列で受け取るコールバック(省略可)。
+    モデルを試すたびに呼ばれる(呼び出しはワーカースレッド上で行われる)。
     """
     if not anonymized_text.strip():
         raise GeminiError("匿名化後の文章が空です。")
@@ -368,15 +648,17 @@ def generate_reply(
     api_keys = _load_api_keys()
     prompt = build_prompt(anonymized_text, reply_intent, style=style)
 
-    caller_specified_model = model != DEFAULT_MODEL
+    # DEFAULT_MODELの明示指定は、従来から「自動選択」と同じ扱い(後方互換)。
+    pinned_model = model if (model and model != DEFAULT_MODEL) else None
 
     resp = None
     chosen_model = ""
     last_error: Exception | None = None
     tried_models: list[str] = []
 
-    for api_key in api_keys:
+    for key_idx, api_key in enumerate(api_keys, 1):
         if _is_groq_key(api_key):
+            _notify(on_progress, f"Groq({GROQ_MODEL}) に文章作成を依頼中... {_key_label(key_idx, len(api_keys))}")
             try:
                 messages = [{"role": "user", "content": prompt}]
                 text = _call_groq_chat(
@@ -392,9 +674,11 @@ def generate_reply(
                     )
             except urllib.error.HTTPError as e:
                 last_error = e
+                _log(f"[generate_reply] Groq HTTPError key {_key_id(api_key)}: {e}")
                 continue
             except Exception as e:  # noqa: BLE001
                 last_error = e
+                _log(f"[generate_reply] Groq Error key {_key_id(api_key)}: {type(e).__name__}: {e}")
                 continue
         else:
             try:
@@ -405,39 +689,89 @@ def generate_reply(
                 last_error = e
                 continue
 
-            config = types.GenerateContentConfig(
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-            )
-            client = genai.Client(api_key=api_key)
-            if caller_specified_model:
-                models_to_try = [model]
+            # 検索グラウンディングは long_search のときだけ付ける。
+            # (無料枠では Gemini 3系 + 検索ツールが即429になるため、short/standard は
+            #  検索なしで最新モデルをそのまま使う。)
+            if style == "long_search":
+                config = types.GenerateContentConfig(
+                    tools=[types.Tool(google_search=types.GoogleSearch())],
+                )
             else:
-                preferred = _preferred_model_for_key(api_key)
-                other = FALLBACK_MODEL if preferred == DEFAULT_MODEL else DEFAULT_MODEL
-                models_to_try = [preferred, other]
+                config = types.GenerateContentConfig()
+            client = genai.Client(api_key=api_key)
+            use_search = style == "long_search"
+            if pinned_model:
+                models_to_try = [pinned_model]
+            elif use_search:
+                # 検索ツール付きは、新しいモデルほど無料枠で使えないことがあるため、
+                # 全候補を新しい順に試す。過去に失敗した組み合わせは(期限内)スキップし、
+                # 全部スキップ対象になってしまう場合は念のため全件を再試行する。
+                candidates = get_flash_models(api_key, client, all_models=True)
+                models_to_try = [m for m in candidates if not _is_grounding_blocked(api_key, m)]
+                if not models_to_try:
+                    models_to_try = candidates
+                if GROUNDING_MAX_MODELS is not None:
+                    models_to_try = models_to_try[:GROUNDING_MAX_MODELS]
+            else:
+                models_to_try = get_flash_models(api_key, client)
 
+            _log(f"[generate_reply] key {_key_id(api_key)} 試行モデル順: {models_to_try}")
+            skipped: list[str] = []  # このキーで使えなかったモデル(進捗表示用)
             for m in models_to_try:
                 if m not in tried_models:
                     tried_models.append(m)
+                _log(f"[generate_reply] -> {m} を試行中...")
+                note = f"{m} に文章作成を依頼中..."
+                if use_search:
+                    note += "(Google検索あり)"
+                if skipped:
+                    note += f" ※先に試した{len(skipped)}件は使用不可"
+                _notify(on_progress, f"{note} {_key_label(key_idx, len(api_keys))}")
+                t0 = time.time()
                 try:
                     resp = client.models.generate_content(model=m, contents=prompt, config=config)
                     chosen_model = m
+                    _log(f"[generate_reply] OK: {m} ({time.time() - t0:.1f}秒)")
                     break
                 except genai_errors.ClientError as e:
-                    if e.code == 404:
-                        last_error = e
-                        continue
+                    last_error = e
+                    skipped.append(m)
+                    _log(f"[generate_reply] ClientError: {m} code={e.code} ({time.time() - t0:.1f}秒) {e}")
+                    if use_search and e.code in (400, 404, 429):
+                        # このキーではこのモデルに検索ツールを付けられない(または枠がない)
+                        # ので記憶し、しばらく試さない。
+                        _mark_grounding_blocked(api_key, m)
                     if e.code == 429:
-                        last_error = e
-                        break
+                        if TRY_OLDER_MODEL_ON_429 or use_search:
+                            continue  # 同じキーで古いモデルを試す
+                        break  # 次のキーへ
+                    if e.code in (400, 404):
+                        # モデルが使えない/そのモデルが検索ツール等に非対応の場合は、
+                        # 次に新しいモデルで再試行する。
+                        continue
                     raise GeminiError(f"Gemini APIとの通信中にエラーが発生しました: {e}") from e
+                except genai_errors.ServerError as e:
+                    # 503(混雑)等。新しいモデルほど起きやすいので次のモデルへ。
+                    last_error = e
+                    skipped.append(m)
+                    _log(
+                        f"[generate_reply] ServerError: {m} code={getattr(e, 'code', '?')} "
+                        f"({time.time() - t0:.1f}秒) {e}"
+                    )
+                    continue
                 except Exception as e:  # noqa: BLE001
+                    _log(f"[generate_reply] 想定外の例外: {m} {type(e).__name__}: {e}")
                     raise GeminiError(f"Gemini APIとの通信中にエラーが発生しました: {e}") from e
             if resp is not None:
                 break
 
     if resp is None:
-        if isinstance(last_error, genai_errors.ClientError) if "genai_errors" in locals() else False and getattr(last_error, "code", None) == 404:
+        _log(
+            f"[generate_reply] 全滅: 試したモデル={tried_models} / "
+            f"最後のエラー={type(last_error).__name__}: {last_error}"
+        )
+        last_code = getattr(last_error, "code", None)
+        if tried_models and last_code == 404:
             message = (
                 f"指定されたモデル({', '.join(tried_models)})がいずれも利用できませんでした。"
                 " gemini_client.pyの設定を見直してください。"
@@ -468,7 +802,8 @@ def generate_reply(
 def generate_reply_with_agent(
     anonymized_text: str,
     reply_intent: str,
-    model: str = DEFAULT_MODEL,
+    model: str | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> GeminiReplyResult:
     """「🤖 AIによる返答生成」のエージェント版。
     1. decide_reply_style() で、匿名化後の文章と返信方針からどのプロンプト
@@ -486,8 +821,10 @@ def generate_reply_with_agent(
     if not anonymized_text.strip():
         raise GeminiError("匿名化後の文章が空です。")
 
-    style, reason = decide_reply_style(anonymized_text, reply_intent)
-    result = generate_reply(anonymized_text, reply_intent, style=style, model=model)
+    style, reason = decide_reply_style(anonymized_text, reply_intent, on_progress=on_progress)
+    result = generate_reply(
+        anonymized_text, reply_intent, style=style, model=model, on_progress=on_progress
+    )
     result.style_reason = reason
     return result
 
