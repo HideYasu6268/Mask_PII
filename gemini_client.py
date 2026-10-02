@@ -214,7 +214,18 @@ style は short/standard/long_search のいずれか、reason は判断理由を
 
 # Groq API設定(gskで始まるキーの場合はGroqで通信)
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_MODEL = "openai/gpt-oss-120b"
+
+# gpt-oss系の推論強度("low" / "medium" / "high")。未指定だとGroq側の既定は "medium"。
+# 推論トークンは max_tokens にも含まれるため、速度やトークン消費を抑えたい場合は
+# "low" に、品質を優先する場合は "medium" / "high" にする。
+GROQ_EFFORT_DECIDE = "medium"  # 判断ステップ
+GROQ_EFFORT_BY_STYLE: dict[str, str] = {
+    "short": "medium",
+    "standard": "medium",
+    "long_search": "medium",
+}
+GROQ_EFFORT_DEFAULT = "medium"
 
 
 def _is_groq_key(api_key: str) -> bool:
@@ -228,14 +239,21 @@ def _call_groq_chat(
     model: str = GROQ_MODEL,
     temperature: float = 0.3,
     max_tokens: int = 2500,
+    reasoning_effort: str | None = GROQ_EFFORT_DEFAULT,
 ) -> str:
-    """Groq API(OpenAI互換)を呼び出す。外部ライブラリ依存を避けるため標準のurllibを使用。"""
+    """Groq API(OpenAI互換)を呼び出す。外部ライブラリ依存を避けるため標準のurllibを使用。
+
+    reasoning_effort: gpt-oss系の推論強度("low" / "medium" / "high")。
+    None を渡すとパラメータを送らず、Groq側の既定("medium")になる。
+    """
     payload = {
         "model": model,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         GROQ_API_URL,
@@ -518,7 +536,7 @@ def decide_reply_style(
 ) -> tuple[str, str]:
     """匿名化後の文章と返信方針から、3種類の返信プロンプト(PROMPT_STYLES)のうち
     どれを使うべきかをLLMに判断させる。
-    - gskで始まるキー: Groq API (openai/gpt-oss-20b)
+    - gskで始まるキー: Groq API (openai/gpt-oss-120b)
     - その他のキー: Gemini API(そのキーで使える最新のflash-lite系モデルから順に試す。
       生成ステップのflash系の無料枠を消費しないため)
 
@@ -547,7 +565,12 @@ def decide_reply_style(
                     {"role": "user", "content": user_content},
                 ]
                 content = _call_groq_chat(
-                    api_key, messages, model=GROQ_MODEL, temperature=0.1, max_tokens=1000
+                    api_key,
+                    messages,
+                    model=GROQ_MODEL,
+                    temperature=0.1,
+                    max_tokens=1000,
+                    reasoning_effort=GROQ_EFFORT_DECIDE,
                 )
             except urllib.error.HTTPError as e:
                 last_error = e
@@ -624,7 +647,7 @@ def generate_reply(
 ) -> GeminiReplyResult:
     """匿名化後の文章と返信方針から、指定されたstyle(PROMPT_STYLES参照)の
     プロンプトを組み立て、LLM APIに送信して返信文の案を取得する。
-    - gskで始まるキー: Groq API (openai/gpt-oss-20b)
+    - gskで始まるキー: Groq API (openai/gpt-oss-120b)
     - その他のキー: Gemini API (Google検索によるグラウンディングを使用)
 
     model を省略(None)、または DEFAULT_MODEL を渡した場合は、そのキーで使える
@@ -661,8 +684,14 @@ def generate_reply(
             _notify(on_progress, f"Groq({GROQ_MODEL}) に文章作成を依頼中... {_key_label(key_idx, len(api_keys))}")
             try:
                 messages = [{"role": "user", "content": prompt}]
+                effort = GROQ_EFFORT_BY_STYLE.get(style, GROQ_EFFORT_DEFAULT)
                 text = _call_groq_chat(
-                    api_key, messages, model=GROQ_MODEL, temperature=0.3, max_tokens=2500
+                    api_key,
+                    messages,
+                    model=GROQ_MODEL,
+                    temperature=0.3,
+                    max_tokens=2500,
+                    reasoning_effort=effort,
                 )
                 if text:
                     return GeminiReplyResult(
