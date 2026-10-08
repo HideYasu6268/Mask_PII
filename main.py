@@ -45,7 +45,8 @@ from tksheet import Sheet
 from pii_core import (
     detect_pii, merge_llm_items, build_placeholder_mapping, apply_mapping,
     reverse_mapping, append_to_master_dictionary, load_master_dictionary,
-    detect_from_dictionary, migrate_dictionary_file_if_needed, PiiItem,
+    detect_from_dictionary, migrate_dictionary_file_if_needed,
+    parse_dictionary_csv_text, save_master_dictionary, PiiItem,
 )
 import gemini_client
 import local_llm
@@ -59,10 +60,32 @@ SHEET_HEADERS = ["元の値", "匿名化後", "種別"]
 
 # プレビュー更新のたびに、対応表の内容(元の値・匿名化後・種別)を蓄積していく
 # マスター辞書CSV。既知の値は上書きせず追記のみ(pii_core.append_to_master_dictionary参照)。
-MASTER_DICTIONARY_PATH = Path(__file__).resolve().parent / "pii_dictionary.csv"
+# 優先は共有サーバー上のファイル。アクセスできない場合はローカルのファイルにフォールバックする。
+NETWORK_DICTIONARY_PATH = Path(r"\\Server\個人別バックアップ20230725～\72安田\MyPython\mail_reply\pii_dictionary.csv")
+LOCAL_DICTIONARY_PATH = Path(__file__).resolve().parent / "pii_dictionary.csv"
+
+
+def get_master_dictionary_path() -> Path:
+    """マスター辞書CSVのパスを取得する。
+    1. サーバー上の NETWORK_DICTIONARY_PATH にアクセス可能(ファイル存在)ならそれを優先。
+    2. サーバーに接続できない・ファイルが存在しない場合はローカルの LOCAL_DICTIONARY_PATH を使う。
+    """
+    try:
+        if NETWORK_DICTIONARY_PATH.is_file():
+            return NETWORK_DICTIONARY_PATH
+    except OSError:
+        pass
+    return LOCAL_DICTIONARY_PATH
+
+
+# 後方互換・起動時チェック用
+MASTER_DICTIONARY_PATH = get_master_dictionary_path()
 # 過去バージョンで作られた旧形式(「元の値,匿名化後,種別」の3列)のファイルが
 # 残っていれば、追記時に列がずれないよう新形式(「元の値,種別」の2列)に書き換えておく。
-migrate_dictionary_file_if_needed(MASTER_DICTIONARY_PATH)
+try:
+    migrate_dictionary_file_if_needed(get_master_dictionary_path())
+except OSError:
+    pass
 
 # 匿名化解除後の返信文の末尾に付ける署名。ファイルが無ければ単に付けない
 # (必須ではない)。呼び出しのたびに読み直すので、アプリを再起動しなくても
@@ -154,16 +177,32 @@ class PiiAnonymizerApp(ctk.CTk):
         self.llm_progress_label = ctk.CTkLabel(bar, text="", text_color="gray")
         self.llm_progress_label.pack(side="left", padx=(12, 0))
 
-        # 右上: 非エンジニアでも署名・Geminiへのプロンプト・APIキーを自分で
+        # 右上: 非エンジニアでも辞書・署名・Geminiへのプロンプト・APIキーを自分で
         # 編集できるようにするボタン群(_open_edit_window参照)。pack(side="right")は
-        # 先に置いたものほど右端に来るため、見た目の並びを「署名/プロンプト/APIキー」に
-        # するには逆順(APIキー→プロンプト→署名)でpackする。
+        # 先に置いたものほど右端に来るため、見た目の並びを「返答生成プルダウン / 辞書 / 署名 / プロンプト / APIキー」に
+        # するには逆順(APIキー→プロンプト→署名→辞書→返答生成プルダウン)でpackする。
         ctk.CTkButton(bar, text="APIキー", width=90,
                       command=self.on_edit_api_key).pack(side="right", padx=(4, 8))
         ctk.CTkButton(bar, text="Geminiへのプロンプト", width=150,
                       command=self.on_edit_prompt_template).pack(side="right", padx=4)
         ctk.CTkButton(bar, text="署名", width=90,
                       command=self.on_edit_signature).pack(side="right", padx=4)
+        ctk.CTkButton(bar, text="辞書", width=90,
+                      command=self.on_edit_dictionary).pack(side="right", padx=4)
+
+        # 返答生成で使うAPIプロバイダの優先度を選ぶプルダウン(「辞書」の隣)。
+        # gemini_client.PREFERRED_PROVIDER を書き換えることで、キーの試行順を動的に変更する。
+        _provider_labels = list(gemini_client.PROVIDER_OPTIONS.keys())
+        self._provider_var = tk.StringVar(value=_provider_labels[0])
+        self._provider_menu = ctk.CTkOptionMenu(
+            bar,
+            values=_provider_labels,
+            variable=self._provider_var,
+            width=170,
+            command=self._on_provider_changed,
+        )
+        self._provider_menu.pack(side="right", padx=(2, 8))
+        ctk.CTkLabel(bar, text="返答生成:").pack(side="right", padx=(8, 2))
 
     def _build_main_area(self):
         self.tabview = ctk.CTkTabview(self, command=self._on_tab_changed)
@@ -620,7 +659,8 @@ class PiiAnonymizerApp(ctk.CTk):
 
         # 過去に人手で確認済みのマスター辞書も、毎回の検出のたびに必ず突き合わせる
         # (これが辞書を蓄積している目的そのものなので、自動で行う)。
-        dict_entries = load_master_dictionary(MASTER_DICTIONARY_PATH)
+        dict_path = get_master_dictionary_path()
+        dict_entries = load_master_dictionary(dict_path) if dict_path.is_file() else {}
         dict_items = detect_from_dictionary(text, dict_entries) if dict_entries else []
 
         added_sync = self._append_items_as_rows(dict_items + regex_ner_items)
@@ -778,8 +818,9 @@ class PiiAnonymizerApp(ctk.CTk):
 
         added_to_dict = 0
         dict_skipped: list[str] = []
+        dict_path = get_master_dictionary_path()
         try:
-            added_to_dict, dict_skipped = append_to_master_dictionary(rows, MASTER_DICTIONARY_PATH)
+            added_to_dict, dict_skipped = append_to_master_dictionary(rows, dict_path)
         except OSError as e:
             messagebox.showwarning(
                 "辞書保存エラー",
@@ -794,6 +835,13 @@ class PiiAnonymizerApp(ctk.CTk):
         if dict_skipped:
             status += f" (文字コードの都合で{len(dict_skipped)}件は辞書に保存できませんでした。)"
         self.set_status(status)
+
+    def _on_provider_changed(self, label: str):
+        """プロバイダ優先度プルダウンが変更されたとき呼ばれる。
+        gemini_client.PREFERRED_PROVIDER を書き換え、次回の返答生成からすぐ反映する。
+        """
+        gemini_client.PREFERRED_PROVIDER = gemini_client.PROVIDER_OPTIONS.get(label, "gemini")
+        self.set_status(f"返答生成のAPIプロバイダを「{label}」に切り替えました。")
 
     def on_generate_reply(self):
         """「🤖 AIによる返答生成」: 匿名化後プレビューの文章 + 「どういう返信をしたいか」欄の
@@ -1107,6 +1155,73 @@ class PiiAnonymizerApp(ctk.CTk):
                 messagebox.showwarning("保存エラー", f"署名の保存に失敗しました: {e}")
 
         self._open_edit_window("署名の編集(返信メール末尾に自動で付きます)", current, save)
+
+    def on_edit_dictionary(self):
+        """マスター辞書(pii_dictionary.csv)を表計算(tksheet)形式で表示・編集する。"""
+        dict_path = get_master_dictionary_path()
+        if dict_path.is_file():
+            entries = load_master_dictionary(dict_path)
+        else:
+            entries = {}
+        data = [[original, info.get("type", "")] for original, info in entries.items()]
+
+        win = ctk.CTkToplevel(self)
+        win.title(f"マスター辞書の編集 ({dict_path})")
+        win.geometry("640x600")
+        win.transient(self)
+
+        ctk.CTkLabel(win, text=f"マスター辞書の編集: {dict_path}",
+                     font=ctk.CTkFont(weight="bold")
+                     ).pack(anchor="w", padx=10, pady=(10, 4))
+
+        sheet_frame = ctk.CTkFrame(win, fg_color="transparent")
+        sheet_frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+        dict_sheet = Sheet(
+            sheet_frame,
+            headers=["元の値", "種別"],
+            data=data,
+        )
+        dict_sheet.enable_bindings(
+            "single_select", "row_select", "column_select",
+            "arrowkeys", "edit_cell", "delete_key", "copy", "paste",
+            "right_click_popup_menu", "rc_insert_row", "rc_delete_row",
+        )
+        dict_sheet.pack(fill="both", expand=True)
+
+        row_btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        row_btn_row.pack(fill="x", padx=10, pady=(0, 4))
+        ctk.CTkButton(row_btn_row, text="行追加", width=1,
+                      command=lambda: dict_sheet.insert_row(["", ""])
+                      ).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(row_btn_row, text="選択行を削除", fg_color="#a33", hover_color="#822", width=1,
+                      command=lambda: dict_sheet.delete_rows(dict_sheet.get_selected_rows())
+                      ).pack(side="left")
+
+        def handle_save():
+            pairs = [
+                (r[0] if len(r) > 0 else "", r[1] if len(r) > 1 else "")
+                for r in dict_sheet.get_sheet_data()
+            ]
+            save_path = get_master_dictionary_path()
+            try:
+                skipped = save_master_dictionary(pairs, save_path)
+            except OSError as e:
+                messagebox.showwarning("保存エラー", f"マスター辞書の保存に失敗しました: {e}")
+                return
+            status = f"マスター辞書を保存しました({save_path})。"
+            if skipped:
+                status += f" (文字コードの都合で{len(skipped)}件は保存できませんでした。)"
+            self.set_status(status)
+            win.destroy()
+            win.destroy()
+
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkButton(btn_row, text="保存", command=handle_save).pack(side="right")
+        ctk.CTkButton(btn_row, text="キャンセル", fg_color="gray40", hover_color="gray30",
+                      command=win.destroy).pack(side="right", padx=(0, 8))
+
+        win.grab_set()
 
     def on_edit_prompt_template(self):
         """返信プロンプトは short/standard/long_search の3種類あるため、まずどれを

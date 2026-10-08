@@ -95,8 +95,10 @@ STYLE_LABELS: dict[str, str] = {
 # models.list() でモデル一覧を取得できなかった場合(通信エラー・権限不足など)に
 # だけ使う固定のフォールバック。通常は get_flash_models() が返す新しい順の
 # リストが使われる。
-DEFAULT_MODEL = "gemini-3.8-flash"
-FALLBACK_MODEL = "gemini-3.6-flash"
+# 2026-10 以降、無料APIキーは flash-lite 系のみに制限されたため、
+# フォールバックも lite 系に変更している。
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
+FALLBACK_MODEL = "gemini-3.1-flash-lite"
 
 # 判断ステップ(decide_reply_style)専用。生成ステップと違い検索が不要な単純な
 # 分類なので、flash-lite系を新しい順に試す(get_lite_models参照)。これにより
@@ -228,9 +230,40 @@ GROQ_EFFORT_BY_STYLE: dict[str, str] = {
 GROQ_EFFORT_DEFAULT = "medium"
 
 
+# ---------------------------------------------------------------------------
+# 優先プロバイダ設定
+# ---------------------------------------------------------------------------
+# "groq"  → Groqキー(gsk...)を先に、Geminiキーを後に並べる
+# "gemini" → Geminiキーを先に、Groqキーを後に並べる(既定)
+# UIからこの変数を書き換えることで動的に切り替える。
+PREFERRED_PROVIDER: str = "gemini"
+
+# プルダウン表示用ラベル → 内部値のマッピング
+PROVIDER_OPTIONS: dict[str, str] = {
+    "Gemini lite 優先": "gemini",
+    "Groq GPT-120B 優先": "groq",
+}
+
+
 def _is_groq_key(api_key: str) -> bool:
     """gskで始まるキーはGroq APIキーと判定する。"""
     return api_key.startswith("gsk")
+
+
+def _sorted_api_keys(keys: list[str]) -> list[str]:
+    """PREFERRED_PROVIDERの設定に従い、APIキーの試行順を並び替える。
+    groq優先: Groqキー(gsk...)が先、Geminiキーが後。
+    gemini優先(既定): Geminiキーが先、Groqキーが後。
+    同じグループ内の順序は元の順序を維持する(安定ソート)。
+    """
+    if PREFERRED_PROVIDER == "groq":
+        groq_keys = [k for k in keys if _is_groq_key(k)]
+        gemini_keys = [k for k in keys if not _is_groq_key(k)]
+        return groq_keys + gemini_keys
+    else:
+        gemini_keys = [k for k in keys if not _is_groq_key(k)]
+        groq_keys = [k for k in keys if _is_groq_key(k)]
+        return gemini_keys + groq_keys
 
 
 def _call_groq_chat(
@@ -441,6 +474,12 @@ def _get_models(
         return _static_fallback_models(lite)
 
     if not candidates:
+        if not lite:
+            # 無料APIキーの制限等で非lite flash系が0件の場合、lite系にフォールバックする。
+            _log(f"key {_key_id(api_key)}: {label}該当モデル0件 -> lite系にフォールバック試行")
+            lite_models = _get_models(api_key, client, force_refresh=False, lite=True, all_models=all_models)
+            if lite_models:
+                return lite_models
         _log(f"key {_key_id(api_key)}: {label}該当モデル0件 -> 固定フォールバック {_static_fallback_models(lite)}")
         return _static_fallback_models(lite)
 
@@ -545,7 +584,7 @@ def decide_reply_style(
     戻り値: (style, reason)。style は PROMPT_STYLES のキーのいずれか。
     """
     try:
-        api_keys = _load_api_keys()
+        api_keys = _sorted_api_keys(_load_api_keys())
     except GeminiError as e:
         return DEFAULT_STYLE, f"判断呼び出し前にエラー({e})のため既定の方針を使用"
 
@@ -668,7 +707,7 @@ def generate_reply(
     if style not in PROMPT_STYLES:
         style = DEFAULT_STYLE
 
-    api_keys = _load_api_keys()
+    api_keys = _sorted_api_keys(_load_api_keys())
     prompt = build_prompt(anonymized_text, reply_intent, style=style)
 
     # DEFAULT_MODELの明示指定は、従来から「自動選択」と同じ扱い(後方互換)。
@@ -766,7 +805,7 @@ def generate_reply(
                     last_error = e
                     skipped.append(m)
                     _log(f"[generate_reply] ClientError: {m} code={e.code} ({time.time() - t0:.1f}秒) {e}")
-                    if use_search and e.code in (400, 404, 429):
+                    if use_search and e.code in (400, 403, 404, 429):
                         # このキーではこのモデルに検索ツールを付けられない(または枠がない)
                         # ので記憶し、しばらく試さない。
                         _mark_grounding_blocked(api_key, m)
@@ -774,9 +813,9 @@ def generate_reply(
                         if TRY_OLDER_MODEL_ON_429 or use_search:
                             continue  # 同じキーで古いモデルを試す
                         break  # 次のキーへ
-                    if e.code in (400, 404):
-                        # モデルが使えない/そのモデルが検索ツール等に非対応の場合は、
-                        # 次に新しいモデルで再試行する。
+                    if e.code in (400, 403, 404):
+                        # モデルが使えない/権限なし(無料枠制限)/検索ツール非対応の場合は、
+                        # 次のモデルで再試行する。
                         continue
                     raise GeminiError(f"Gemini APIとの通信中にエラーが発生しました: {e}") from e
                 except genai_errors.ServerError as e:
