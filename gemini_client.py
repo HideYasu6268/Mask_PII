@@ -121,8 +121,18 @@ GROUNDING_BLOCK_TTL_SEC = 30 * 60
 # 同じバージョンなら安定版を preview より先に試す。
 INCLUDE_PREVIEW_MODELS = True
 
-# 1回のAPI呼び出しで、1つのキーにつき最大何個のモデルを新しい順に試すか。
-MAX_MODELS_TO_TRY = 4
+# 生成ステップ(generate_reply)でflash系モデルを試す際、何番目に新しいモデルから
+# 始めるか(0-based)。メール返信は最新モデルでなくとも品質が十分なため、
+# 3番目に新しいもの(インデックス2)から試行を始める。
+FLASH_MODEL_START_INDEX = 2
+
+# FLASH_MODEL_START_INDEX から何個のモデルを試すか。
+# これを超えたら lite系にフォールバックする。
+MAX_MODELS_TO_TRY = 3
+
+# 1回のAPI呼び出しで、判断ステップ(decide_reply_style)に使う
+# lite系モデルを最大何個試すか(生成ステップの MAX_MODELS_TO_TRY とは独立)。
+MAX_LITE_MODELS_TO_TRY = 4
 
 # 429(レート制限)は通常モデル単位のクォータなので、同じキーで古いモデルなら
 # 通る場合がある。Trueにすると、429でも次のキーへ行く前に同じキーで古いモデルを
@@ -388,8 +398,10 @@ def _parse_flash_model(name: str) -> tuple[str, tuple[int, ...], int] | None:
 def get_flash_models(
     api_key: str, client=None, force_refresh: bool = False, all_models: bool = False
 ) -> list[str]:
-    """生成ステップ用: そのキーで使える通常のflash系モデルを新しい順で返す(_get_models参照)。
-    all_models=True なら MAX_MODELS_TO_TRY で切らず、全候補を返す。"""
+    """生成ステップ用: そのキーで使える通常のflash系モデルを返す(_get_models参照)。
+    all_models=True なら切り取りなしで全候補を返す。
+    通常(all_models=False)は FLASH_MODEL_START_INDEX 番目から MAX_MODELS_TO_TRY 個を返す。
+    つまり「3番目に新しいモデルから3つ」という方針になる。"""
     return _get_models(api_key, client, force_refresh, lite=False, all_models=all_models)
 
 
@@ -426,7 +438,12 @@ def _get_models(
             cached = _model_cache.get(cache_id)
         if cached and now - cached[0] < MODEL_CACHE_TTL_SEC:
             _log(f"key {_key_id(api_key)}: {label}モデル一覧はキャッシュ利用 -> {cached[1]}")
-            return list(cached[1] if all_models else cached[1][:MAX_MODELS_TO_TRY])
+            if all_models:
+                return list(cached[1])
+            if lite:
+                return list(cached[1][:MAX_LITE_MODELS_TO_TRY])
+            sliced = cached[1][FLASH_MODEL_START_INDEX:FLASH_MODEL_START_INDEX + MAX_MODELS_TO_TRY]
+            return list(sliced) if sliced else list(cached[1][:MAX_MODELS_TO_TRY])
 
     try:
         if client is None:
@@ -465,7 +482,14 @@ def _get_models(
         all_candidates = [value[1] for _, value in ordered]
         _log(f"  {label}候補(絞り込み後・新しい順): {all_candidates}")
         candidates = all_candidates
-        _log(f"  試行対象(通常は上位{MAX_MODELS_TO_TRY}件 / 検索ありは全件): {candidates[:MAX_MODELS_TO_TRY]}")
+        if lite:
+            _log(f"  試行対象(上位{MAX_LITE_MODELS_TO_TRY}件): {candidates[:MAX_LITE_MODELS_TO_TRY]}")
+        else:
+            sliced = candidates[FLASH_MODEL_START_INDEX:FLASH_MODEL_START_INDEX + MAX_MODELS_TO_TRY]
+            _log(
+                f"  試行対象(index {FLASH_MODEL_START_INDEX}〜 の{MAX_MODELS_TO_TRY}件): "
+                f"{sliced or candidates[:MAX_MODELS_TO_TRY]}"
+            )
     except Exception as e:  # noqa: BLE001
         _log(
             f"key {_key_id(api_key)}: models.list() 失敗 -> 固定フォールバック "
@@ -485,7 +509,14 @@ def _get_models(
 
     with _model_cache_lock:
         _model_cache[cache_id] = (now, candidates)
-    return list(candidates if all_models else candidates[:MAX_MODELS_TO_TRY])
+    if all_models:
+        return list(candidates)
+    if lite:
+        return list(candidates[:MAX_LITE_MODELS_TO_TRY])
+    # 生成ステップ: FLASH_MODEL_START_INDEX 番目から MAX_MODELS_TO_TRY 個。
+    # 候補がそれほど多くない場合(インデックスが範囲外)は先頭から返す。
+    sliced = candidates[FLASH_MODEL_START_INDEX:FLASH_MODEL_START_INDEX + MAX_MODELS_TO_TRY]
+    return list(sliced) if sliced else list(candidates[:MAX_MODELS_TO_TRY])
 
 
 @dataclass
@@ -827,9 +858,45 @@ def generate_reply(
                         f"({time.time() - t0:.1f}秒) {e}"
                     )
                     continue
-                except Exception as e:  # noqa: BLE001
-                    _log(f"[generate_reply] 想定外の例外: {m} {type(e).__name__}: {e}")
-                    raise GeminiError(f"Gemini APIとの通信中にエラーが発生しました: {e}") from e
+
+            # flash系(3番目から3つ)が全滅した場合、lite系にフォールバックして再挑戦する。
+            # pinned_model 指定時・use_search時・すでに成功した場合はスキップ。
+            if resp is None and not pinned_model and not use_search:
+                lite_models = get_lite_models(api_key, client)
+                if lite_models:
+                    _log(f"[generate_reply] flash系全滅 -> lite系にフォールバック: {lite_models}")
+                    _notify(
+                        on_progress,
+                        f"flash系モデルが使用不可のため、lite系({lite_models[0]})で再試行中..."
+                        f" {_key_label(key_idx, len(api_keys))}",
+                    )
+                    lite_config = types.GenerateContentConfig()
+                    for m in lite_models:
+                        if m not in tried_models:
+                            tried_models.append(m)
+                        _log(f"[generate_reply] [lite fallback] -> {m} を試行中...")
+                        t0 = time.time()
+                        try:
+                            resp = client.models.generate_content(
+                                model=m, contents=prompt, config=lite_config
+                            )
+                            chosen_model = m
+                            _log(f"[generate_reply] [lite fallback] OK: {m} ({time.time() - t0:.1f}秒)")
+                            break
+                        except genai_errors.ClientError as e:
+                            last_error = e
+                            _log(f"[generate_reply] [lite fallback] ClientError: {m} code={e.code} {e}")
+                            if e.code == 429:
+                                if TRY_OLDER_MODEL_ON_429:
+                                    continue
+                                break
+                            if e.code in (400, 403, 404):
+                                continue
+                            raise GeminiError(f"Gemini APIとの通信中にエラーが発生しました: {e}") from e
+                        except genai_errors.ServerError as e:
+                            last_error = e
+                            _log(f"[generate_reply] [lite fallback] ServerError: {m} {e}")
+                            continue
             if resp is not None:
                 break
 
